@@ -71,6 +71,7 @@
 // -------- PCA9554 Helfer --------
 static uint8_t pcaOutputState = EXIO_LCD_RST | EXIO_TP_RST | EXIO_LCD_CS;
 static uint8_t gt911Addr = GT911_ADDR_PRIMARY;
+static bool gt911Found = false;
 static uint8_t currentPage = 0;
 static bool ntpTimeSynced = false;
 
@@ -179,10 +180,10 @@ static bool i2cRegRead16(uint8_t addr, uint16_t reg, uint8_t *data, uint8_t len)
   Wire.beginTransmission(addr);
   Wire.write(reg >> 8);
   Wire.write(reg & 0xFF);
-  if (Wire.endTransmission(false) != 0) {
+  if (Wire.endTransmission(true) != 0) {
     return false;
   }
-  uint8_t got = Wire.requestFrom(addr, len);
+  uint8_t got = Wire.requestFrom((int)addr, (int)len);
   if (got != len) {
     while (Wire.available()) {
       Wire.read();
@@ -209,12 +210,11 @@ static void gt911ResetAddressMode() {
   pinMode(PIN_TOUCH_INT, OUTPUT);
   digitalWrite(PIN_TOUCH_INT, LOW);  // LOW during reset selects the common 0x5D address.
   pcaSetOutputBits(EXIO_TP_RST, false);
-  delay(20);
+  delay(10);
   pcaSetOutputBits(EXIO_TP_RST, true);
-  delay(80);
+  delay(200);
   digitalWrite(PIN_TOUCH_INT, HIGH);
-  delay(2);
-  pinMode(PIN_TOUCH_INT, INPUT_PULLUP);
+  pinMode(PIN_TOUCH_INT, INPUT);
   delay(50);
 }
 
@@ -224,9 +224,12 @@ static void gt911Init() {
   uint8_t id[4] = {0};
   if (i2cRegRead16(GT911_ADDR_PRIMARY, GT911_PRODUCT_ID, id, sizeof(id))) {
     gt911Addr = GT911_ADDR_PRIMARY;
+    gt911Found = true;
   } else if (i2cRegRead16(GT911_ADDR_ALT, GT911_PRODUCT_ID, id, sizeof(id))) {
     gt911Addr = GT911_ADDR_ALT;
+    gt911Found = true;
   } else {
+    gt911Found = false;
     Serial.println("GT911: not found on 0x5D/0x14");
     return;
   }
@@ -239,9 +242,16 @@ static void gt911Init() {
 static bool readTouch(uint16_t *x, uint16_t *y) {
   uint8_t status = 0;
   if (!i2cRegRead16(gt911Addr, GT911_READ_XY, &status, 1)) {
-    return false;
+    uint8_t otherAddr = (gt911Addr == GT911_ADDR_PRIMARY) ? GT911_ADDR_ALT : GT911_ADDR_PRIMARY;
+    if (!i2cRegRead16(otherAddr, GT911_READ_XY, &status, 1)) {
+      return false;
+    }
+    gt911Addr = otherAddr;
+    gt911Found = true;
   }
   if ((status & 0x80) == 0) {
+    uint8_t clear = 0;
+    i2cRegWrite16(gt911Addr, GT911_READ_XY, &clear, 1);
     return false;
   }
 
@@ -261,7 +271,7 @@ static bool readTouch(uint16_t *x, uint16_t *y) {
 
   *x = (uint16_t)point[2] | ((uint16_t)point[3] << 8);
   *y = (uint16_t)point[4] | ((uint16_t)point[5] << 8);
-  return *x < 480 && *y < 480;
+  return true;
 }
 
 // -------- ST7701 Init-Sequenz Waveshare 2.8C/2.8D (480x480) --------
