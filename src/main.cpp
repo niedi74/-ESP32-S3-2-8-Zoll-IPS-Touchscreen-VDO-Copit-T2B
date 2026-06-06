@@ -74,6 +74,7 @@ static uint8_t gt911Addr = GT911_ADDR_PRIMARY;
 static bool gt911Found = false;
 static uint8_t currentPage = 0;
 static bool ntpTimeSynced = false;
+static bool touchSeen = false;
 
 static int monthFromBuildName(const char *month) {
   static const char *months = "JanFebMarAprMayJunJulAugSepOctNovDec";
@@ -206,21 +207,20 @@ static bool i2cRegWrite16(uint8_t addr, uint16_t reg, const uint8_t *data, uint8
   return Wire.endTransmission() == 0;
 }
 
-static void gt911ResetAddressMode() {
+static void gt911ResetAddressMode(bool intHigh) {
   pinMode(PIN_TOUCH_INT, OUTPUT);
-  digitalWrite(PIN_TOUCH_INT, LOW);  // LOW during reset selects the common 0x5D address.
+  digitalWrite(PIN_TOUCH_INT, intHigh ? HIGH : LOW);
   pcaSetOutputBits(EXIO_TP_RST, false);
   delay(10);
   pcaSetOutputBits(EXIO_TP_RST, true);
   delay(200);
-  digitalWrite(PIN_TOUCH_INT, HIGH);
+  digitalWrite(PIN_TOUCH_INT, intHigh ? HIGH : LOW);
+  delay(5);
   pinMode(PIN_TOUCH_INT, INPUT);
   delay(50);
 }
 
-static void gt911Init() {
-  gt911ResetAddressMode();
-
+static bool gt911Probe() {
   uint8_t id[4] = {0};
   if (i2cRegRead16(GT911_ADDR_PRIMARY, GT911_PRODUCT_ID, id, sizeof(id))) {
     gt911Addr = GT911_ADDR_PRIMARY;
@@ -230,13 +230,29 @@ static void gt911Init() {
     gt911Found = true;
   } else {
     gt911Found = false;
-    Serial.println("GT911: not found on 0x5D/0x14");
-    return;
+    return false;
   }
 
   Serial.printf("GT911: addr 0x%02X id %c%c%c%c\n", gt911Addr, id[0], id[1], id[2], id[3]);
   uint8_t clear = 0;
   i2cRegWrite16(gt911Addr, GT911_READ_XY, &clear, 1);
+  return true;
+}
+
+static void gt911Init() {
+  Serial.println("GT911: reset/probe INT low");
+  gt911ResetAddressMode(false);
+  if (gt911Probe()) {
+    return;
+  }
+
+  Serial.println("GT911: reset/probe INT high");
+  gt911ResetAddressMode(true);
+  if (gt911Probe()) {
+    return;
+  }
+
+  Serial.println("GT911: not found on 0x5D/0x14");
 }
 
 static bool readTouch(uint16_t *x, uint16_t *y) {
@@ -838,7 +854,7 @@ void setup() {
 
   Serial.printf("PSRAM found: %s, size: %u bytes\n", psramFound() ? "yes" : "no", ESP.getPsramSize());
 
-  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL, 400000);
+  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL, 100000);
   scanI2C();
   Serial.println("PCA9554: init + reset");
   expanderInit();
@@ -862,11 +878,13 @@ void setup() {
 void loop() {
   static uint32_t lastTouch = 0;
   static uint32_t lastClockDraw = 0;
+  static bool menuSelfTestDone = false;
   uint16_t x = 0;
   uint16_t y = 0;
 
   if (readTouch(&x, &y) && millis() - lastTouch > 350) {
     lastTouch = millis();
+    touchSeen = true;
     Serial.printf("touch x=%u y=%u page=%u\n", x, y, currentPage);
 
     if (currentPage == 0) {
@@ -883,6 +901,13 @@ void loop() {
   if (currentPage == 0 && millis() - lastClockDraw >= 1000) {
     lastClockDraw = millis();
     drawVdoClock();
+  }
+
+  if (!touchSeen && !menuSelfTestDone && millis() > 10000) {
+    menuSelfTestDone = true;
+    currentPage = 1;
+    drawMenuOverview();
+    Serial.println("page: menu self-test (no touch seen)");
   }
 
   delay(10);
