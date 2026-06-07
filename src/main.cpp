@@ -138,15 +138,38 @@ static bool readClockTime(struct tm *now) {
   return localtime_r(&t, now) != nullptr;
 }
 
+static uint8_t pca9554WriteOnce(uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(PCA9554_ADDR);
+  Wire.write(reg);
+  Wire.write(val);
+  return Wire.endTransmission();
+}
+
+// Cold-Boot-Robust: bis zu 5 Versuche mit Delay. Der PCA9554 reagiert
+// direkt nach Power-On manchmal nicht auf den ersten I2C-Burst (I2C-Bus
+// noch nicht stabil). Bei Replug per USB war genau das der Grund warum
+// das Display schwarz blieb: erster expander-write erreichte den Chip
+// nicht, CS blieb HIGH, ST7701-Init ging ins Leere.
 static void pca9554Write(uint8_t reg, uint8_t val) {
   if (reg == PCA9554_OUTPUT) {
     pcaOutputState = val;
   }
-  Wire.beginTransmission(PCA9554_ADDR);
-  Wire.write(reg);
-  Wire.write(val);
-  uint8_t err = Wire.endTransmission();
-  Serial.printf("PCA9554 write reg 0x%02X = 0x%02X -> %u\n", reg, val, err);
+  uint8_t err = 0xFF;
+  for (uint8_t attempt = 0; attempt < 5; attempt++) {
+    err = pca9554WriteOnce(reg, val);
+    if (err == 0) {
+      if (attempt > 0) {
+        Serial.printf("PCA9554 write reg 0x%02X = 0x%02X -> OK (try %u)\n",
+                      reg, val, attempt + 1);
+      } else {
+        Serial.printf("PCA9554 write reg 0x%02X = 0x%02X -> 0\n", reg, val);
+      }
+      return;
+    }
+    delay(10);
+  }
+  Serial.printf("PCA9554 write reg 0x%02X = 0x%02X -> FAIL (last err %u)\n",
+                reg, val, err);
 }
 
 static void pcaSetOutputBits(uint8_t mask, bool high) {
@@ -437,6 +460,14 @@ static void nativeSt7701Init() {
 
   pca9554Write(PCA9554_OUTPUT, EXIO_LCD_RST | EXIO_TP_RST); // CS low
   delay(10);
+
+  // Software-Reset zuerst, sonst behaelt der ST7701 bei Hot-Replug Reste
+  // seines vorherigen Zustands (z.B. falsche aktive Register-Page) und
+  // die Init-Sequenz landet im Leeren -> Display bleibt schwarz.
+  nativeWriteCommand(0x01);  // SWRESET
+  delay(120);
+  nativeWriteCommand(0x11);  // Sleep Out
+  delay(120);
 
   nativeWriteCommand(0xFF); nativeWriteData(0x77); nativeWriteData(0x01); nativeWriteData(0x00); nativeWriteData(0x00); nativeWriteData(0x13);
   nativeWriteCommand(0xEF); nativeWriteData(0x08);
@@ -848,6 +879,12 @@ static void drawMenuOverview() {
 }
 
 void setup() {
+  // Cold-Boot Robustness: erst 250ms warten damit die Versorgung sauber
+  // hochlaeuft, bevor wir I2C/Display anpacken. Bei direktem USB-Plug-in
+  // war das Display sonst manchmal schwarz weil der PCA9554 noch nicht
+  // sicher antwortet und der erste expander-Write ins Leere ging.
+  delay(250);
+
   Serial.begin(115200);
   delay(1500);
   Serial.println("\n=== Waveshare 2.8C VDO Clock — Bring-up (Arduino_GFX) ===");
@@ -855,6 +892,7 @@ void setup() {
   Serial.printf("PSRAM found: %s, size: %u bytes\n", psramFound() ? "yes" : "no", ESP.getPsramSize());
 
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL, 100000);
+  delay(20);  // I2C-Bus erstmal still lassen
   scanI2C();
   Serial.println("PCA9554: init + reset");
   expanderInit();
