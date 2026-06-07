@@ -2,3 +2,7 @@
 .vscode/
 *.bin
 *.elf
+
+# Lokale WiFi-Zugangsdaten
+src/wifi_secret.h
+build_err.txt

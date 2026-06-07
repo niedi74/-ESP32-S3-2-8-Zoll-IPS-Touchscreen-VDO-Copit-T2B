@@ -13,7 +13,14 @@
 
 #include <Arduino.h>
 #include <Wire.h>
+#include <Preferences.h>
 #include <WiFi.h>
+#if __has_include("wifi_secret.h")
+  #include "wifi_secret.h"
+#else
+  #define WIFI_SSID     ""
+  #define WIFI_PASSWORD ""
+#endif
 #include <Arduino_GFX_Library.h>
 #include "driver/spi_master.h"
 #include "esp_heap_caps.h"
@@ -38,6 +45,11 @@
 #define GT911_ADDR_ALT     0x14
 #define GT911_PRODUCT_ID   0x8140
 #define GT911_READ_XY      0x814E
+
+// ---- PCF85063 RTC (Echtzeituhr, Batterie-Backup) ----
+#define PCF85063_ADDR      0x51
+#define PCF85063_CTRL1     0x00
+#define PCF85063_SECONDS   0x04   // sec, min, hour, day, wday, month, year (7 Byte)
 
 // ---- LCD ST7701 Init-SPI (3-wire; CS extern via Expander) ----
 #define PIN_LCD_SCK   2
@@ -73,69 +85,156 @@ static uint8_t pcaOutputState = EXIO_LCD_RST | EXIO_TP_RST | EXIO_LCD_CS;
 static uint8_t gt911Addr = GT911_ADDR_PRIMARY;
 static bool gt911Found = false;
 static uint8_t currentPage = 0;
-static bool ntpTimeSynced = false;
 static bool touchSeen = false;
+static char g_ipStr[20] = "---";   // IP-Adresse fuers Menue
 
-static int monthFromBuildName(const char *month) {
-  static const char *months = "JanFebMarAprMayJunJulAugSepOctNovDec";
-  const char *pos = strstr(months, month);
-  return pos ? ((pos - months) / 3) : 0;
+// Build-Zeit-Fallbacks falls inject_time.py nicht lief
+#ifndef RTC_BUILD_Y
+#define RTC_BUILD_Y 2026
+#define RTC_BUILD_MO 1
+#define RTC_BUILD_D 1
+#define RTC_BUILD_H 12
+#define RTC_BUILD_MI 0
+#define RTC_BUILD_S 0
+#define RTC_BUILD_DOW 4
+#define RTC_BUILD_ID 0
+#endif
+
+// ---- PCF85063 RTC Helfer ----
+static uint8_t decToBcd(uint8_t v) { return (uint8_t)((v / 10 * 16) + (v % 10)); }
+static uint8_t bcdToDec(uint8_t v) { return (uint8_t)((v / 16 * 10) + (v % 16)); }
+
+// RTC auslesen in struct tm (lokale Wall-Clock-Zeit).
+static bool rtcRead(struct tm *now) {
+  Wire.beginTransmission(PCF85063_ADDR);
+  Wire.write(PCF85063_SECONDS);
+  if (Wire.endTransmission(true) != 0) return false;
+  if (Wire.requestFrom((int)PCF85063_ADDR, 7) != 7) return false;
+  uint8_t b[7];
+  for (int i = 0; i < 7; i++) b[i] = Wire.read();
+  now->tm_sec  = bcdToDec(b[0] & 0x7F);
+  now->tm_min  = bcdToDec(b[1] & 0x7F);
+  now->tm_hour = bcdToDec(b[2] & 0x3F);
+  now->tm_mday = bcdToDec(b[3] & 0x3F);
+  now->tm_wday = bcdToDec(b[4] & 0x07);
+  now->tm_mon  = bcdToDec(b[5] & 0x1F) - 1;     // 1-12 -> 0-11
+  now->tm_year = bcdToDec(b[6]) + 100;          // Jahr ab 2000 -> tm_year ab 1900
+  return true;
 }
 
-static void setClockFromBuildTime() {
-  char monthName[4] = {__DATE__[0], __DATE__[1], __DATE__[2], 0};
-  struct tm t = {};
-  t.tm_year = atoi(__DATE__ + 7) - 1900;
-  t.tm_mon = monthFromBuildName(monthName);
-  t.tm_mday = atoi(__DATE__ + 4);
-  t.tm_hour = atoi(__TIME__);
-  t.tm_min = atoi(__TIME__ + 3);
-  t.tm_sec = atoi(__TIME__ + 6);
-  time_t epoch = mktime(&t);
-  if (epoch > 1700000000) {
-    timeval tv = {epoch, 0};
-    settimeofday(&tv, nullptr);
-  }
-}
+// RTC stellen aus struct tm.
+static void rtcWrite(const struct tm *t) {
+  // CTRL1: Normalbetrieb, 24h, 12.5pF Lastkapazitaet
+  Wire.beginTransmission(PCF85063_ADDR);
+  Wire.write(PCF85063_CTRL1);
+  Wire.write(0x01);  // CAP_SEL=12.5pF, STOP=0 (laeuft)
+  Wire.endTransmission();
 
-static void initTimeSource() {
-  setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1);
-  tzset();
-  setClockFromBuildTime();
-
-  if (strlen(HOME_WIFI_SSID) == 0) {
-    Serial.println("Time: WiFi SSID empty, using build-time fallback");
-    return;
-  }
-
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(HOME_WIFI_SSID, HOME_WIFI_PASSWORD);
-  Serial.print("WiFi: connecting for NTP");
-  uint32_t start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 8000) {
-    delay(250);
-    Serial.print(".");
-  }
-  Serial.println();
-
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi: not connected, using build-time fallback");
-    WiFi.disconnect(true);
-    WiFi.mode(WIFI_OFF);
-    return;
-  }
-
-  configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", "pool.ntp.org", "time.nist.gov");
-  struct tm now = {};
-  ntpTimeSynced = getLocalTime(&now, 8000);
-  Serial.printf("Time: %s\n", ntpTimeSynced ? "NTP synced" : "NTP timeout, using fallback");
-  WiFi.disconnect(true);
-  WiFi.mode(WIFI_OFF);
+  Wire.beginTransmission(PCF85063_ADDR);
+  Wire.write(PCF85063_SECONDS);
+  Wire.write(decToBcd(t->tm_sec));
+  Wire.write(decToBcd(t->tm_min));
+  Wire.write(decToBcd(t->tm_hour));
+  Wire.write(decToBcd(t->tm_mday));
+  Wire.write(decToBcd(t->tm_wday));
+  Wire.write(decToBcd(t->tm_mon + 1));
+  Wire.write(decToBcd((t->tm_year + 1900) - 2000));
+  Wire.endTransmission();
 }
 
 static bool readClockTime(struct tm *now) {
+  if (rtcRead(now)) return true;
+  // Fallback falls RTC nicht antwortet: Systemzeit
   time_t t = time(nullptr);
   return localtime_r(&t, now) != nullptr;
+}
+
+static void initTimeSource() {
+  struct tm rtcNow = {};
+  bool haveRtc = rtcRead(&rtcNow);
+  bool rtcValid = haveRtc && (rtcNow.tm_year + 1900) >= 2024;
+
+  // RTC genau einmal pro Flash stellen (neue Build-ID) oder wenn ungueltig.
+  Preferences prefs;
+  prefs.begin("clock", false);
+  uint32_t savedId = prefs.getUInt("buildid", 0);
+  bool newFlash = (savedId != (uint32_t)RTC_BUILD_ID);
+
+  if (!rtcValid || newFlash) {
+    struct tm bt = {};
+    bt.tm_year = RTC_BUILD_Y - 1900;
+    bt.tm_mon  = RTC_BUILD_MO - 1;
+    bt.tm_mday = RTC_BUILD_D;
+    bt.tm_hour = RTC_BUILD_H;
+    bt.tm_min  = RTC_BUILD_MI;
+    bt.tm_sec  = RTC_BUILD_S;
+    bt.tm_wday = RTC_BUILD_DOW;
+    rtcWrite(&bt);
+    prefs.putUInt("buildid", (uint32_t)RTC_BUILD_ID);
+    Serial.printf("RTC set from build time: %04d-%02d-%02d %02d:%02d:%02d (reason: %s)\n",
+                  RTC_BUILD_Y, RTC_BUILD_MO, RTC_BUILD_D, RTC_BUILD_H, RTC_BUILD_MI, RTC_BUILD_S,
+                  !rtcValid ? "RTC invalid" : "new flash");
+  } else {
+    Serial.printf("RTC running: %04d-%02d-%02d %02d:%02d:%02d\n",
+                  rtcNow.tm_year + 1900, rtcNow.tm_mon + 1, rtcNow.tm_mday,
+                  rtcNow.tm_hour, rtcNow.tm_min, rtcNow.tm_sec);
+  }
+  prefs.end();
+}
+
+// Nicht-blockierender WiFi/NTP-Handler, wird aus loop() aufgerufen.
+// - WiFi verbindet im Hintergrund (in setup gestartet), blockiert nie.
+// - Sobald verbunden: IP merken, SNTP einmal starten.
+// - Sobald SNTP eine gueltige Zeit liefert: einmal in RTC schreiben.
+// - Bei Verbindungsverlust: automatischer Reconnect-Versuch alle 30s.
+// Rueckgabe: true wenn gerade frisch synchronisiert (Uhr neu zeichnen).
+static bool wifiNtpTick() {
+  static bool sntpStarted = false;
+  static bool ntpSynced = false;
+  static uint32_t lastTry = 0;
+
+  if (strlen(WIFI_SSID) == 0) return false;
+
+  if (WiFi.status() != WL_CONNECTED) {
+    // alle 30s erneut versuchen
+    if (millis() - lastTry > 30000) {
+      lastTry = millis();
+      WiFi.disconnect();
+      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+      Serial.println("WiFi: Reconnect-Versuch");
+    }
+    if (g_ipStr[0] == '-') strcpy(g_ipStr, "...");
+    return false;
+  }
+
+  // Verbunden -> IP merken
+  static char lastIp[20] = "";
+  snprintf(g_ipStr, sizeof(g_ipStr), "%s", WiFi.localIP().toString().c_str());
+  if (strcmp(lastIp, g_ipStr) != 0) {
+    strcpy(lastIp, g_ipStr);
+    Serial.printf("WiFi verbunden, IP: %s\n", g_ipStr);
+  }
+
+  if (!sntpStarted) {
+    configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", "pool.ntp.org", "time.nist.gov", "de.pool.ntp.org");
+    sntpStarted = true;
+    Serial.println("NTP: SNTP gestartet");
+  }
+
+  if (!ntpSynced) {
+    time_t t = time(nullptr);
+    if (t > 1700000000) {  // gueltige Zeit angekommen (nach 2023)
+      struct tm now;
+      localtime_r(&t, &now);
+      rtcWrite(&now);
+      ntpSynced = true;
+      Serial.printf("NTP: synchronisiert -> RTC gestellt: %04d-%02d-%02d %02d:%02d:%02d\n",
+                    now.tm_year + 1900, now.tm_mon + 1, now.tm_mday,
+                    now.tm_hour, now.tm_min, now.tm_sec);
+      return true;  // Uhr neu zeichnen
+    }
+  }
+  return false;
 }
 
 static uint8_t pca9554WriteOnce(uint8_t reg, uint8_t val) {
@@ -672,6 +771,8 @@ static uint8_t glyphColumn(char c, uint8_t col) {
     case '7': { static const uint8_t v[5] = {0x01, 0x71, 0x09, 0x05, 0x03}; g = v; break; }
     case '8': { static const uint8_t v[5] = {0x36, 0x49, 0x49, 0x49, 0x36}; g = v; break; }
     case '9': { static const uint8_t v[5] = {0x06, 0x49, 0x49, 0x29, 0x1E}; g = v; break; }
+    case '.': { static const uint8_t v[5] = {0x00, 0x00, 0x40, 0x00, 0x00}; g = v; break; }
+    case ':': { static const uint8_t v[5] = {0x00, 0x00, 0x24, 0x00, 0x00}; g = v; break; }
     default: break;
   }
   return g[col];
@@ -809,6 +910,12 @@ static void drawMenuOverview() {
   drawMenuTile(60, 190, 360, 58, "MOTOR", RGB565(40, 150, 210));
   drawMenuTile(60, 260, 360, 58, "LAMBDA", RGB565(60, 185, 90));
   drawMenuTile(60, 330, 360, 58, "SETUP", RGB565(210, 170, 45));
+
+  // IP-Adresse im Netz unten anzeigen
+  char ipLine[32];
+  snprintf(ipLine, sizeof(ipLine), "IP %s", g_ipStr);
+  drawTextCentered(240, 404, ipLine, RGB565(150, 200, 150), 2);
+
   presentFrame();
 }
 
@@ -860,6 +967,15 @@ void setup() {
 
   drawVdoClock();
   Serial.println("VDO clock drawn.");
+
+  // WiFi-Verbindung im Hintergrund starten (nicht-blockierend). NTP-Sync
+  // und IP-Anzeige passieren im loop() sobald die Verbindung steht, ohne
+  // den Boot oder die Uhr aufzuhalten. Retry laeuft automatisch weiter.
+  if (strlen(WIFI_SSID) > 0) {
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    Serial.printf("WiFi: Verbindung zu '%s' im Hintergrund gestartet\n", WIFI_SSID);
+  }
 }
 
 void loop() {
@@ -882,6 +998,11 @@ void loop() {
       drawVdoClock();
       Serial.println("page: clock");
     }
+  }
+
+  // WiFi/NTP im Hintergrund (nicht-blockierend). Bei frischem Sync Uhr neu.
+  if (wifiNtpTick() && currentPage == 0) {
+    drawVdoClock();
   }
 
   if (currentPage == 0 && millis() - lastClockDraw >= 1000) {
