@@ -187,15 +187,27 @@ static void scanI2C() {
   }
 }
 
-// Expander init: Pin0..2 Output, Reset-Puls Display+Touch, dann LCD-CS aktiv LOW.
+// Expander init: Pin0..2 Output, HARTER Reset-Puls Display+Touch.
+// Bei USB-Replug bleiben die Caps geladen → ST7701 behaelt korrupten
+// internen Zustand. Loesung: RST-Pin SEHR lang LOW halten damit der
+// interne State-Machine-Reset sicher greift, dann lange Settle-Zeit.
 static void expanderInit() {
   pca9554Write(PCA9554_CONFIG, 0xF8);   // Pin0..2 = Output
+
+  // 1) Alles HIGH (Ausgangs-Zustand)
   pca9554Write(PCA9554_OUTPUT, EXIO_LCD_RST | EXIO_TP_RST | EXIO_LCD_CS);
-  delay(20);
-  pca9554Write(PCA9554_OUTPUT, EXIO_LCD_CS);
-  delay(20);
+  delay(50);
+
+  // 2) RST LOW — wie in der funktionierenden Referenz (Boatingwiththebaileys):
+  //    kurzer Puls 10ms low, 50ms high reicht.
+  pca9554Write(PCA9554_OUTPUT, EXIO_LCD_CS);  // RST LOW, CS HIGH
+  delay(10);
+
+  // 3) RST HIGH — 50ms Settle
   pca9554Write(PCA9554_OUTPUT, EXIO_LCD_RST | EXIO_TP_RST | EXIO_LCD_CS);
-  delay(120);
+  delay(50);
+
+  // 4) CS LOW fuer SPI-Init
   pca9554Write(PCA9554_OUTPUT, EXIO_LCD_RST | EXIO_TP_RST);
   delay(10);
 }
@@ -313,133 +325,42 @@ static bool readTouch(uint16_t *x, uint16_t *y) {
   return true;
 }
 
-// -------- ST7701 Init-Sequenz Waveshare 2.8C/2.8D (480x480) --------
-// Uebersetzt aus dem offiziellen Waveshare ESP-BSP
-// (waveshareteam/Waveshare-ESP32-components, esp32_s3_touch_lcd_2_8d.c)
-// ins Arduino_GFX init_operations Format.
-static const uint8_t waveshare_28c_init[] = {
-    BEGIN_WRITE,
-    WRITE_COMMAND_8, 0x11,  // Sleep out
-    END_WRITE,
-    DELAY, 120,
-    BEGIN_WRITE,
-    WRITE_COMMAND_8, 0xFF, WRITE_BYTES, 5, 0x77, 0x01, 0x00, 0x00, 0x13,
-    WRITE_C8_D8, 0xFE, 0x08,
-    WRITE_COMMAND_8, 0xFF, WRITE_BYTES, 5, 0x77, 0x01, 0x00, 0x00, 0x10,
-    WRITE_C8_D16, 0xC0, 0x3B, 0x00,
-    WRITE_C8_D16, 0xC1, 0x10, 0x0C,
-    WRITE_C8_D16, 0xC2, 0x07, 0x0A,
-    WRITE_C8_D8, 0xC7, 0x00,
-    WRITE_C8_D8, 0xCC, 0x10,
-    WRITE_C8_D8, 0xCD, 0x08,
-    WRITE_COMMAND_8, 0xB0, WRITE_BYTES, 16,
-      0x05, 0x12, 0x98, 0x0E, 0x0F, 0x07, 0x07, 0x09,
-      0x09, 0x23, 0x05, 0x52, 0x0F, 0x67, 0x2C, 0x11,
-    WRITE_COMMAND_8, 0xB1, WRITE_BYTES, 16,
-      0x0B, 0x11, 0x97, 0x0C, 0x12, 0x06, 0x06, 0x08,
-      0x08, 0x22, 0x03, 0x51, 0x11, 0x66, 0x2B, 0x0F,
-    WRITE_COMMAND_8, 0xFF, WRITE_BYTES, 5, 0x77, 0x01, 0x00, 0x00, 0x11,
-    WRITE_C8_D8, 0xB0, 0x5D,
-    WRITE_C8_D8, 0xB1, 0x3E,
-    WRITE_C8_D8, 0xB2, 0x81,
-    WRITE_C8_D8, 0xB3, 0x80,
-    WRITE_C8_D8, 0xB5, 0x4E,
-    WRITE_C8_D8, 0xB7, 0x85,
-    WRITE_C8_D8, 0xB8, 0x20,
-    WRITE_C8_D8, 0xC1, 0x78,
-    WRITE_C8_D8, 0xC2, 0x78,
-    WRITE_C8_D8, 0xD0, 0x88,
-    WRITE_COMMAND_8, 0xE0, WRITE_BYTES, 3, 0x00, 0x00, 0x02,
-    WRITE_COMMAND_8, 0xE1, WRITE_BYTES, 11,
-      0x06, 0x30, 0x08, 0x30, 0x05, 0x30, 0x07, 0x30, 0x00, 0x33, 0x33,
-    WRITE_COMMAND_8, 0xE2, WRITE_BYTES, 12,
-      0x11, 0x11, 0x33, 0x33, 0xF4, 0x00, 0x00, 0x00, 0xF4, 0x00, 0x00, 0x00,
-    WRITE_COMMAND_8, 0xE3, WRITE_BYTES, 4, 0x00, 0x00, 0x11, 0x11,
-    WRITE_C8_D16, 0xE4, 0x44, 0x44,
-    WRITE_COMMAND_8, 0xE5, WRITE_BYTES, 16,
-      0x0D, 0xF5, 0x30, 0xF0, 0x0F, 0xF7, 0x30, 0xF0,
-      0x09, 0xF1, 0x30, 0xF0, 0x0B, 0xF3, 0x30, 0xF0,
-    WRITE_COMMAND_8, 0xE6, WRITE_BYTES, 4, 0x00, 0x00, 0x11, 0x11,
-    WRITE_C8_D16, 0xE7, 0x44, 0x44,
-    WRITE_COMMAND_8, 0xE8, WRITE_BYTES, 16,
-      0x0C, 0xF4, 0x30, 0xF0, 0x0E, 0xF6, 0x30, 0xF0,
-      0x08, 0xF0, 0x30, 0xF0, 0x0A, 0xF2, 0x30, 0xF0,
-    WRITE_C8_D16, 0xE9, 0x36, 0x01,
-    WRITE_COMMAND_8, 0xEB, WRITE_BYTES, 7, 0x00, 0x01, 0xE4, 0xE4, 0x44, 0x88, 0x40,
-    WRITE_COMMAND_8, 0xED, WRITE_BYTES, 16,
-      0xFF, 0x10, 0xAF, 0x76, 0x54, 0x2B, 0xCF, 0xFF,
-      0xFF, 0xFC, 0xB2, 0x45, 0x67, 0xFA, 0x01, 0xFF,
-    WRITE_COMMAND_8, 0xFF, WRITE_BYTES, 5, 0x77, 0x01, 0x00, 0x00, 0x00,
-    WRITE_COMMAND_8, 0x11,  // Sleep out (page 0)
-    END_WRITE,
-    DELAY, 120,
-    BEGIN_WRITE,
-    WRITE_C8_D8, 0x3A, 0x66,  // COLMOD 18-bit
-    WRITE_C8_D8, 0x36, 0x00,
-    WRITE_C8_D8, 0x35, 0x00,  // TE on
-    WRITE_COMMAND_8, 0x29,    // Display ON
-    END_WRITE,
-};
+// ST7701 Init-Sequenz: nur noch in nativeSt7701Init() (native SPI).
 
-// -------- Arduino_GFX Aufbau --------
-// SWSPI fuer ST7701-Init: DC=-1 (9-bit SPI), CS=-1 (extern via Expander), SCK, MOSI
-Arduino_DataBus *bus = new Arduino_SWSPI(
-    GFX_NOT_DEFINED /* DC */, GFX_NOT_DEFINED /* CS extern */,
-    PIN_LCD_SCK, PIN_LCD_MOSI, GFX_NOT_DEFINED /* MISO */);
-
-// RGB-Timing aus der offiziellen Waveshare 2.8C Demo.
-// Arduino demo: 30MHz; ESP-IDF demo: 18MHz. 18MHz ist fuer Bring-up stabiler.
-Arduino_ESP32RGBPanel *rgbpanel = new Arduino_ESP32RGBPanel(
-    PIN_DE, PIN_VSYNC, PIN_HSYNC, PIN_PCLK,
-    PIN_R0, PIN_R1, PIN_R2, PIN_R3, PIN_R4,
-    PIN_G0, PIN_G1, PIN_G2, PIN_G3, PIN_G4, PIN_G5,
-    PIN_B0, PIN_B1, PIN_B2, PIN_B3, PIN_B4,
-    0 /* hsync_polarity */, 50 /* hsync_front_porch */, 8 /* hsync_pulse_width */, 10 /* hsync_back_porch */,
-    0 /* vsync_polarity */, 8 /* vsync_front_porch */, 2 /* vsync_pulse_width */, 18 /* vsync_back_porch */,
-    0 /* pclk_active_neg */, 18000000 /* prefer_speed Hz */, false /* useBigEndian */,
-    0 /* de_idle_high */, 0 /* pclk_idle_high */, 4800 /* bounce_buffer_size_px */);
-
-// ST7701 RGB-Display, 480x480, RST=-1 (extern via Expander), IPS=true.
-Arduino_RGB_Display *gfx = new Arduino_RGB_Display(
-    480, 480, rgbpanel, 0 /* rotation */, true /* auto_flush */,
-    bus, GFX_NOT_DEFINED /* RST extern */,
-    TL028WVC01_init_operations, sizeof(TL028WVC01_init_operations));
-
-static void drawTestScreen() {
-  gfx->fillScreen(RGB565_BLACK);
-  gfx->fillCircle(240, 240, 235, RGB565_RED);
-  gfx->fillCircle(240, 240, 180, RGB565_GREEN);
-  gfx->fillCircle(240, 240, 120, RGB565_BLUE);
-  gfx->fillCircle(240, 240, 60, RGB565_BLACK);
-
-  gfx->setTextColor(RGB565_WHITE);
-  gfx->setTextSize(3);
-  gfx->setCursor(150, 222);
-  gfx->println("VDO");
-  gfx->setTextSize(2);
-  gfx->setCursor(150, 258);
-  gfx->println("Bring-up");
-}
+// HINWEIS: Arduino_GFX globale Objekte (bus/rgbpanel/gfx) wurden entfernt.
+// Sie liefen ihre Konstruktoren VOR setup() und konfigurierten GPIO-Pins
+// (SPI + RGB), was mit dem nativen ESP-IDF Init kollidierte.
+// Das war die Ursache fuer "Display schwarz nach Replug".
 
 static spi_device_handle_t nativeSpi = nullptr;
 static esp_lcd_panel_handle_t nativePanel = nullptr;
 static uint16_t *nativeFrame = nullptr;
 
 static void nativeWriteCommand(uint8_t cmd) {
+  if (!nativeSpi) return;
   spi_transaction_t t = {};
   t.cmd = 0;
   t.addr = cmd;
-  ESP_ERROR_CHECK(spi_device_transmit(nativeSpi, &t));
+  spi_device_transmit(nativeSpi, &t);
 }
 
 static void nativeWriteData(uint8_t data) {
+  if (!nativeSpi) return;
   spi_transaction_t t = {};
   t.cmd = 1;
   t.addr = data;
-  ESP_ERROR_CHECK(spi_device_transmit(nativeSpi, &t));
+  spi_device_transmit(nativeSpi, &t);
 }
 
 static void nativeSt7701Init() {
+  // Bei Warm-Reset (USB replug -> rst:0x15) kann der SPI-Bus noch vom
+  // vorherigen Lauf belegt sein. Erst freigeben, dann neu init.
+  if (nativeSpi) {
+    spi_bus_remove_device(nativeSpi);
+    nativeSpi = nullptr;
+  }
+  spi_bus_free(SPI2_HOST);  // ignore error if not initialized
+
   spi_bus_config_t buscfg = {};
   buscfg.mosi_io_num = PIN_LCD_MOSI;
   buscfg.miso_io_num = -1;
@@ -447,7 +368,8 @@ static void nativeSt7701Init() {
   buscfg.quadwp_io_num = -1;
   buscfg.quadhd_io_num = -1;
   buscfg.max_transfer_sz = 64;
-  ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO));
+  esp_err_t err = spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO);
+  Serial.printf("SPI bus init: %s\n", esp_err_to_name(err));
 
   spi_device_interface_config_t devcfg = {};
   devcfg.command_bits = 1;
@@ -456,19 +378,17 @@ static void nativeSt7701Init() {
   devcfg.clock_speed_hz = 40000000;
   devcfg.spics_io_num = -1;
   devcfg.queue_size = 1;
-  ESP_ERROR_CHECK(spi_bus_add_device(SPI2_HOST, &devcfg, &nativeSpi));
+  err = spi_bus_add_device(SPI2_HOST, &devcfg, &nativeSpi);
+  Serial.printf("SPI device add: %s\n", esp_err_to_name(err));
 
   pca9554Write(PCA9554_OUTPUT, EXIO_LCD_RST | EXIO_TP_RST); // CS low
   delay(10);
 
-  // Software-Reset zuerst, sonst behaelt der ST7701 bei Hot-Replug Reste
-  // seines vorherigen Zustands (z.B. falsche aktive Register-Page) und
-  // die Init-Sequenz landet im Leeren -> Display bleibt schwarz.
-  nativeWriteCommand(0x01);  // SWRESET
-  delay(120);
-  nativeWriteCommand(0x11);  // Sleep Out
-  delay(120);
-
+  // WICHTIG: KEIN SWRESET, KEIN frueher Sleep-Out!
+  // Die funktionierende Referenz (Boatingwiththebaileys / Waveshare BSP)
+  // startet direkt mit der Page-13-Sequenz. Ein SWRESET hier laesst das
+  // Panel in einem Zustand zurueck wo die Init nicht greift -> Display
+  // wird rosa/rot statt das Bild zu zeigen.
   nativeWriteCommand(0xFF); nativeWriteData(0x77); nativeWriteData(0x01); nativeWriteData(0x00); nativeWriteData(0x00); nativeWriteData(0x13);
   nativeWriteCommand(0xEF); nativeWriteData(0x08);
   nativeWriteCommand(0xFF); nativeWriteData(0x77); nativeWriteData(0x01); nativeWriteData(0x00); nativeWriteData(0x00); nativeWriteData(0x10);
@@ -523,6 +443,17 @@ static void nativeSt7701Init() {
 }
 
 static void nativePanelInit() {
+  // Warm-Reset: altes Panel zerstoeren falls vorhanden
+  if (nativePanel) {
+    esp_lcd_panel_del(nativePanel);
+    nativePanel = nullptr;
+  }
+  // Frame-Buffer freigeben (wird in ensureFrame() neu alloziert)
+  if (nativeFrame) {
+    heap_caps_free(nativeFrame);
+    nativeFrame = nullptr;
+  }
+
   esp_lcd_rgb_panel_config_t cfg = {};
   cfg.clk_src = LCD_CLK_SRC_PLL160M;
   cfg.timings.pclk_hz = 8000000;
@@ -537,9 +468,8 @@ static void nativePanelInit() {
   cfg.timings.flags.pclk_active_neg = 0;
   cfg.data_width = 16;
   cfg.bits_per_pixel = 16;
-  cfg.num_fbs = 2;
+  cfg.num_fbs = 1;   // single fb wie funktionierende Referenz
   cfg.bounce_buffer_size_px = 0;
-  cfg.sram_trans_align = 8;
   cfg.psram_trans_align = 64;
   cfg.hsync_gpio_num = PIN_HSYNC;
   cfg.vsync_gpio_num = PIN_VSYNC;
@@ -564,9 +494,13 @@ static void nativePanelInit() {
   cfg.data_gpio_nums[15] = PIN_R4;
   cfg.flags.fb_in_psram = true;
 
-  ESP_ERROR_CHECK(esp_lcd_new_rgb_panel(&cfg, &nativePanel));
-  ESP_ERROR_CHECK(esp_lcd_panel_reset(nativePanel));
-  ESP_ERROR_CHECK(esp_lcd_panel_init(nativePanel));
+  esp_err_t err = esp_lcd_new_rgb_panel(&cfg, &nativePanel);
+  Serial.printf("RGB panel create: %s\n", esp_err_to_name(err));
+  if (err != ESP_OK) return;
+  err = esp_lcd_panel_reset(nativePanel);
+  Serial.printf("RGB panel reset: %s\n", esp_err_to_name(err));
+  err = esp_lcd_panel_init(nativePanel);
+  Serial.printf("RGB panel init: %s\n", esp_err_to_name(err));
 }
 
 static void nativeFill(uint16_t color) {
@@ -580,7 +514,7 @@ static void nativeFill(uint16_t color) {
   for (int i = 0; i < 480 * 480; i++) {
     nativeFrame[i] = color;
   }
-  ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(nativePanel, 0, 0, 480, 480, nativeFrame));
+  if (nativePanel) esp_lcd_panel_draw_bitmap(nativePanel, 0, 0, 480, 480, nativeFrame);
 }
 
 static bool ensureFrame() {
@@ -592,8 +526,8 @@ static bool ensureFrame() {
 }
 
 static void presentFrame() {
-  if (nativeFrame) {
-    ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(nativePanel, 0, 0, 480, 480, nativeFrame));
+  if (nativeFrame && nativePanel) {
+    esp_lcd_panel_draw_bitmap(nativePanel, 0, 0, 480, 480, nativeFrame);
   }
 }
 
@@ -886,10 +820,25 @@ void setup() {
   delay(250);
 
   Serial.begin(115200);
-  delay(1500);
-  Serial.println("\n=== Waveshare 2.8C VDO Clock — Bring-up (Arduino_GFX) ===");
+  // USB-CDC: Nicht auf Host warten. Wenn kein Serial-Monitor offen ist,
+  // soll der Boot trotzdem sofort weiterlaufen.
+  uint32_t serialWait = millis();
+  while (!Serial && millis() - serialWait < 2000) delay(10);
+  Serial.println("\n=== Waveshare 2.8C VDO Clock ===");
 
   Serial.printf("PSRAM found: %s, size: %u bytes\n", psramFound() ? "yes" : "no", ESP.getPsramSize());
+
+  // Backlight Diagnose-Blink: 2x 50ms ON-OFF, damit man sieht dass der
+  // Chip bootet und GPIO 6 schaltbar ist — selbst wenn der Panel-Init
+  // spaeter scheitert, sieht man wenigstens "die Hardware lebt".
+  pinMode(PIN_LCD_BL, OUTPUT);
+  digitalWrite(PIN_LCD_BL, HIGH);
+  delay(50);
+  digitalWrite(PIN_LCD_BL, LOW);
+  delay(50);
+  digitalWrite(PIN_LCD_BL, HIGH);
+  delay(50);
+  digitalWrite(PIN_LCD_BL, LOW);   // wieder aus, sonst sieht man Init-Muell
 
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL, 100000);
   delay(20);  // I2C-Bus erstmal still lassen
@@ -916,7 +865,6 @@ void setup() {
 void loop() {
   static uint32_t lastTouch = 0;
   static uint32_t lastClockDraw = 0;
-  static bool menuSelfTestDone = false;
   uint16_t x = 0;
   uint16_t y = 0;
 
@@ -939,13 +887,6 @@ void loop() {
   if (currentPage == 0 && millis() - lastClockDraw >= 1000) {
     lastClockDraw = millis();
     drawVdoClock();
-  }
-
-  if (!touchSeen && !menuSelfTestDone && millis() > 10000) {
-    menuSelfTestDone = true;
-    currentPage = 1;
-    drawMenuOverview();
-    Serial.println("page: menu self-test (no touch seen)");
   }
 
   delay(10);
