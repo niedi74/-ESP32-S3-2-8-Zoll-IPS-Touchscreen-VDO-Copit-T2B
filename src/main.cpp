@@ -94,6 +94,8 @@ static uint8_t g_lastTouchStatus = 0;
 static uint32_t g_lastTouchMs = 0;
 static char g_ipStr[20] = "---";   // IP-Adresse fuers Menue
 static int  g_dialScalePct = 100;  // Zifferblatt-Groesse in % (50..100)
+static int  g_brightnessPct = 100; // LCD-Helligkeit in % (5..100)
+static uint8_t g_rotation = 0;      // Display-Rotation: 0,1,2,3 = 0/90/180/270 Grad
 static bool g_redrawClock = false; // Flag: Uhr neu zeichnen (z.B. nach Web-Aenderung)
 static bool g_redrawPage = false;  // Flag: aktuelle Display-Seite neu zeichnen
 static WebServer webServer(80);
@@ -599,6 +601,7 @@ static bool readTouch(uint16_t *x, uint16_t *y) {
 static spi_device_handle_t nativeSpi = nullptr;
 static esp_lcd_panel_handle_t nativePanel = nullptr;
 static uint16_t *nativeFrame = nullptr;
+static uint16_t *presentFrameBuf = nullptr;
 
 static void nativeWriteCommand(uint8_t cmd) {
   if (!nativeSpi) return;
@@ -791,7 +794,31 @@ static bool ensureFrame() {
 
 static void presentFrame() {
   if (nativeFrame && nativePanel) {
-    esp_lcd_panel_draw_bitmap(nativePanel, 0, 0, 480, 480, nativeFrame);
+    if (g_rotation == 0) {
+      esp_lcd_panel_draw_bitmap(nativePanel, 0, 0, 480, 480, nativeFrame);
+      return;
+    }
+    if (!presentFrameBuf) {
+      presentFrameBuf = (uint16_t *)heap_caps_malloc(480 * 480 * sizeof(uint16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+      Serial.printf("presentFrameBuf: %p\n", presentFrameBuf);
+    }
+    if (!presentFrameBuf) {
+      esp_lcd_panel_draw_bitmap(nativePanel, 0, 0, 480, 480, nativeFrame);
+      return;
+    }
+    for (int y = 0; y < 480; y++) {
+      for (int x = 0; x < 480; x++) {
+        const uint16_t c = nativeFrame[y * 480 + x];
+        if (g_rotation == 1) {
+          presentFrameBuf[x * 480 + (479 - y)] = c;
+        } else if (g_rotation == 2) {
+          presentFrameBuf[(479 - y) * 480 + (479 - x)] = c;
+        } else {
+          presentFrameBuf[(479 - x) * 480 + y] = c;
+        }
+      }
+    }
+    esp_lcd_panel_draw_bitmap(nativePanel, 0, 0, 480, 480, presentFrameBuf);
   }
 }
 
@@ -1222,11 +1249,13 @@ static void drawSetupPage() {
   char buf[28];
   snprintf(buf, sizeof(buf), "%d %%", g_dialScalePct);
   drawDataRow(112, "UHR", buf, RGB565(235, 235, 225));
-  drawDataRow(152, "TOUCH", touchSeen ? "AKTIV" : "WARTET", touchSeen ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
-  drawDataRow(192, "WIFI", WiFi.status() == WL_CONNECTED ? "OK" : "---", WiFi.status() == WL_CONNECTED ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
-  drawDataRow(232, "IP", g_ipStr, RGB565(150, 200, 150));
-  drawDataRow(272, "BLE", g_bleConn ? "HUB OK" : "SCAN", g_bleConn ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
-  drawDataRow(312, "WEB", "BROWSER", RGB565(150, 200, 150));
+  snprintf(buf, sizeof(buf), "%d %%", g_brightnessPct);
+  drawDataRow(152, "HELL", buf, RGB565(235, 235, 225));
+  snprintf(buf, sizeof(buf), "%u DEG", g_rotation * 90);
+  drawDataRow(192, "ROT", buf, RGB565(235, 235, 225));
+  drawDataRow(232, "TOUCH", touchSeen ? "AKTIV" : "WARTET", touchSeen ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
+  drawDataRow(272, "WIFI", WiFi.status() == WL_CONNECTED ? "OK" : "---", WiFi.status() == WL_CONNECTED ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
+  drawDataRow(312, "BLE", g_bleConn ? "HUB OK" : "SCAN", g_bleConn ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
 
   drawTextCentered(240, 370, "TIP MENU", RGB565(180, 180, 170), 2);
   presentFrame();
@@ -1246,9 +1275,14 @@ static void loadSettings() {
   Preferences p;
   p.begin("clock", true);
   g_dialScalePct = p.getInt("scale", 100);
+  g_brightnessPct = p.getInt("bright", 100);
+  g_rotation = static_cast<uint8_t>(p.getUChar("rot", 0));
   p.end();
   if (g_dialScalePct < 30) g_dialScalePct = 30;
   if (g_dialScalePct > 100) g_dialScalePct = 100;
+  if (g_brightnessPct < 5) g_brightnessPct = 5;
+  if (g_brightnessPct > 100) g_brightnessPct = 100;
+  if (g_rotation > 3) g_rotation = 0;
 }
 
 static void saveDialScale(int pct) {
@@ -1258,6 +1292,36 @@ static void saveDialScale(int pct) {
   Preferences p;
   p.begin("clock", false);
   p.putInt("scale", pct);
+  p.end();
+}
+
+static void applyBrightness()
+{
+  int pct = g_brightnessPct;
+  if (pct < 5) pct = 5;
+  if (pct > 100) pct = 100;
+  const int duty = map(pct, 0, 100, 0, 255);
+  analogWrite(PIN_LCD_BL, duty);
+}
+
+static void saveBrightness(int pct) {
+  if (pct < 5) pct = 5;
+  if (pct > 100) pct = 100;
+  g_brightnessPct = pct;
+  Preferences p;
+  p.begin("clock", false);
+  p.putInt("bright", pct);
+  p.end();
+  applyBrightness();
+}
+
+static void saveRotation(int rot) {
+  if (rot < 0) rot = 0;
+  if (rot > 3) rot = 3;
+  g_rotation = static_cast<uint8_t>(rot);
+  Preferences p;
+  p.begin("clock", false);
+  p.putUChar("rot", g_rotation);
   p.end();
 }
 
@@ -1308,6 +1372,23 @@ static void handleWebRoot() {
     "<br><button type='submit'>&Uuml;bernehmen</button></form>"
     "<div><a href='/set?scale=100'>100%</a> &middot; <a href='/set?scale=90'>90%</a> &middot; "
     "<a href='/set?scale=80'>80%</a> &middot; <a href='/set?scale=70'>70%</a></div></div>");
+  html += F("<div class='card'><h3>Helligkeit</h3>"
+    "<form action='/set' method='get'>"
+    "<div class='val'><span id='b'>");
+  html += String(g_brightnessPct);
+  html += F("</span>%</div>"
+    "<input type='range' name='bright' min='5' max='100' step='1' value='");
+  html += String(g_brightnessPct);
+  html += F("' oninput=\"document.getElementById('b').innerText=this.value\">"
+    "<br><button type='submit'>&Uuml;bernehmen</button></form>"
+    "<div><a href='/set?bright=100'>100%</a> &middot; <a href='/set?bright=70'>70%</a> &middot; "
+    "<a href='/set?bright=40'>40%</a> &middot; <a href='/set?bright=15'>15%</a></div></div>");
+  html += F("<div class='card'><h3>Rotation</h3>");
+  html += "<div class='val'>" + String(g_rotation * 90) + "&deg;</div>";
+  html += F("<a href='/set?rot=0'><button>0&deg;</button></a>"
+    "<a href='/set?rot=1'><button>90&deg;</button></a>"
+    "<a href='/set?rot=2'><button>180&deg;</button></a>"
+    "<a href='/set?rot=3'><button>270&deg;</button></a></div>");
   html += F("<p style='color:#666'>VW T2b Cockpit &middot; ESP32-S3 2.8\"</p></body></html>");
   webServer.send(200, "text/html", html);
 }
@@ -1317,6 +1398,16 @@ static void handleWebSet() {
     saveDialScale(webServer.arg("scale").toInt());
     g_redrawPage = true;
     Serial.printf("Web: Zifferblatt-Groesse = %d%%\n", g_dialScalePct);
+  }
+  if (webServer.hasArg("bright")) {
+    saveBrightness(webServer.arg("bright").toInt());
+    g_redrawPage = true;
+    Serial.printf("Web: Helligkeit = %d%%\n", g_brightnessPct);
+  }
+  if (webServer.hasArg("rot")) {
+    saveRotation(webServer.arg("rot").toInt());
+    g_redrawPage = true;
+    Serial.printf("Web: Rotation = %u deg\n", g_rotation * 90);
   }
   webServer.sendHeader("Location", "/");
   webServer.send(303);
@@ -1386,9 +1477,11 @@ void setup() {
   loadSettings();
   initTimeSource();
 
-  // Backlight an
+  // Backlight mit gespeicherter Helligkeit einschalten.
   pinMode(PIN_LCD_BL, OUTPUT);
-  digitalWrite(PIN_LCD_BL, HIGH);
+  analogWriteResolution(PIN_LCD_BL, 8);
+  analogWriteFrequency(PIN_LCD_BL, 5000);
+  applyBrightness();
 
   drawVdoClock();
   Serial.println("VDO clock drawn.");
@@ -1419,7 +1512,19 @@ void loop() {
   if (readTouch(&x, &y) && millis() - lastTouch > 350) {
     lastTouch = millis();
     touchSeen = true;
-    Serial.printf("touch x=%u y=%u page=%u\n", x, y, currentPage);
+    const uint16_t rawX = x;
+    const uint16_t rawY = y;
+    if (g_rotation == 1) {
+      x = rawY;
+      y = 479 - rawX;
+    } else if (g_rotation == 2) {
+      x = 479 - rawX;
+      y = 479 - rawY;
+    } else if (g_rotation == 3) {
+      x = 479 - rawY;
+      y = rawX;
+    }
+    Serial.printf("touch raw=%u/%u logical=%u/%u rot=%u page=%u\n", rawX, rawY, x, y, g_rotation * 90, currentPage);
 
     if (currentPage == 0) {
       // Uhr -> Menue
