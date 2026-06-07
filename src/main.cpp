@@ -16,6 +16,7 @@
 #include <Preferences.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <NimBLEDevice.h>
 #if __has_include("wifi_secret.h")
   #include "wifi_secret.h"
 #else
@@ -87,11 +88,161 @@ static uint8_t gt911Addr = GT911_ADDR_PRIMARY;
 static bool gt911Found = false;
 static uint8_t currentPage = 0;
 static bool touchSeen = false;
+static uint16_t g_lastTouchX = 0;
+static uint16_t g_lastTouchY = 0;
+static uint8_t g_lastTouchStatus = 0;
+static uint32_t g_lastTouchMs = 0;
 static char g_ipStr[20] = "---";   // IP-Adresse fuers Menue
 static int  g_dialScalePct = 100;  // Zifferblatt-Groesse in % (50..100)
 static bool g_redrawClock = false; // Flag: Uhr neu zeichnen (z.B. nach Web-Aenderung)
+static bool g_redrawPage = false;  // Flag: aktuelle Display-Seite neu zeichnen
 static WebServer webServer(80);
 static void startWebServer();   // Forward-Deklaration (Definition vor setup())
+
+// -------- Spartan3-Hub BLE-Client --------
+#define SPARTAN_MAC     "30:30:f9:1d:d0:fd"
+#define SPARTAN_SVC     "7f510001-5a6b-4d2a-9f20-14a7f3e20000"
+#define SPARTAN_STATUS  "7f510002-5a6b-4d2a-9f20-14a7f3e20000"
+
+// Live-Daten vom Hub
+static float g_lambda = 0, g_rpm = 0, g_adv = 0, g_map = 0;
+static float g_battVolt = 0, g_speedKmh = 0;
+static float g_g123Volt = 0, g_g123Temp = 0, g_g123Coil = 0;
+static bool  g_lambdaValid = false, g_battValid = false;
+static bool  g_speedValid = false, g_g123Valid = false;
+static bool  g_bleConn = false;
+static uint32_t g_bleLastRx = 0;   // millis des letzten Notify
+static uint32_t g_bleRxCnt = 0;
+
+// BLE-Verbindungs-State
+static NimBLEClient* bleClient = nullptr;
+static NimBLEAddress bleTarget;
+static volatile bool bleDoConnect = false;
+static uint32_t bleNextScanAt = 0;
+
+// Kompakt-Format parsen: L<lam>R<rpm>A<adv>M<map>[V<volt>][S<kmh>][I<v>T<t>C<c>]
+static void parseSpartanPayload(const String& p) {
+  if (!(p.startsWith("L") && p.indexOf('R') > 1)) return;
+  int posR = p.indexOf('R');
+  int posA = p.indexOf('A', posR + 1);
+  int posM = p.indexOf('M', posA + 1);
+  if (!(posR > 1 && posA > posR && posM > posA)) return;
+
+  g_lambda = p.substring(1, posR).toFloat();        g_lambdaValid = true;
+  g_rpm    = p.substring(posR + 1, posA).toFloat();
+  g_adv    = p.substring(posA + 1, posM).toFloat();
+
+  int posV = p.indexOf('V', posM + 1);
+  int posS = p.indexOf('S', posM + 1);
+  int posI = p.indexOf('I', posM + 1);
+  int mapEnd = posV > posM ? posV : (posS > posM ? posS : (posI > posM ? posI : p.length()));
+  g_map = p.substring(posM + 1, mapEnd).toFloat();
+
+  if (posV > posM) {
+    int vEnd = posS > posV ? posS : (posI > posV ? posI : p.length());
+    float v = p.substring(posV + 1, vEnd).toFloat();
+    if (v > 0.5f) { g_battVolt = v; g_battValid = true; }
+  }
+  if (posS > posM) {
+    int sEnd = posI > posS ? posI : p.length();
+    g_speedKmh = p.substring(posS + 1, sEnd).toFloat();
+    g_speedValid = true;
+  }
+  if (posI > posM) {
+    int posT = p.indexOf('T', posI + 1);
+    int posC = p.indexOf('C', posT > 0 ? posT + 1 : posI + 1);
+    if (posT > posI && posC > posT) {
+      g_g123Volt = p.substring(posI + 1, posT).toFloat();
+      g_g123Temp = p.substring(posT + 1, posC).toFloat();
+      g_g123Coil = p.substring(posC + 1).toFloat();
+      g_g123Valid = true;
+    }
+  }
+  g_bleRxCnt++;
+  g_bleLastRx = millis();
+}
+
+static void bleNotifyCB(NimBLERemoteCharacteristic*, uint8_t* data, size_t len, bool) {
+  String s;
+  s.reserve(len + 1);
+  for (size_t i = 0; i < len; i++) s += (char)data[i];
+  parseSpartanPayload(s);
+}
+
+class SpartanClientCB : public NimBLEClientCallbacks {
+  void onConnect(NimBLEClient*) override {
+    g_bleConn = true;
+    Serial.println("BLE: mit Spartan-Hub verbunden");
+  }
+  void onDisconnect(NimBLEClient*, int reason) override {
+    g_bleConn = false;
+    Serial.printf("BLE: getrennt (reason=%d), neuer Scan\n", reason);
+    bleNextScanAt = millis() + 1500;
+  }
+  bool onConnParamsUpdateRequest(NimBLEClient*, const ble_gap_upd_params*) override {
+    return true;
+  }
+};
+
+class SpartanScanCB : public NimBLEScanCallbacks {
+  void onResult(const NimBLEAdvertisedDevice* dev) override {
+    String addr = dev->getAddress().toString().c_str();
+    addr.toLowerCase();
+    String name = dev->getName().c_str();
+    if (addr == SPARTAN_MAC || name == SPARTAN_HUB_NAME ||
+        dev->isAdvertisingService(NimBLEUUID(SPARTAN_SVC))) {
+      bleTarget = dev->getAddress();
+      bleDoConnect = true;
+      NimBLEDevice::getScan()->stop();
+      Serial.printf("BLE: Spartan-Hub gefunden (%s)\n", addr.c_str());
+    }
+  }
+  void onScanEnd(const NimBLEScanResults&, int) override {
+    if (!g_bleConn && !bleDoConnect) bleNextScanAt = millis() + 2000;
+  }
+};
+
+static SpartanClientCB spartanClientCB;
+static SpartanScanCB   spartanScanCB;
+
+static void bleStartScan() {
+  if (g_bleConn || bleDoConnect) return;
+  auto* s = NimBLEDevice::getScan();
+  s->setScanCallbacks(&spartanScanCB);
+  s->setActiveScan(true);
+  s->setInterval(100);
+  s->setWindow(99);
+  s->start(8000, false);
+  Serial.println("BLE: Scan nach Spartan-Hub...");
+}
+
+static void bleConnect() {
+  bleDoConnect = false;
+  if (!bleClient) {
+    bleClient = NimBLEDevice::createClient();
+    bleClient->setClientCallbacks(&spartanClientCB, false);
+  }
+  if (!bleClient->connect(bleTarget, true, false, false)) {
+    Serial.println("BLE: Connect fehlgeschlagen");
+    bleNextScanAt = millis() + 2000;
+    return;
+  }
+  auto* svc = bleClient->getService(SPARTAN_SVC);
+  if (!svc) { Serial.println("BLE: kein Service"); bleNextScanAt = millis() + 2000; return; }
+  auto* status = svc->getCharacteristic(SPARTAN_STATUS);
+  if (!status) { Serial.println("BLE: kein Status-Char"); bleNextScanAt = millis() + 2000; return; }
+  bool ok = status->subscribe(true, bleNotifyCB, true);
+  Serial.printf("BLE: Subscribe %s\n", ok ? "OK" : "FAIL");
+}
+
+// Nicht-blockierend aus loop() aufrufen.
+static void bleTick() {
+  if (bleDoConnect) { bleConnect(); return; }
+  if (!g_bleConn && bleNextScanAt != 0 && millis() >= bleNextScanAt) {
+    bleNextScanAt = 0;
+    bleStartScan();
+  }
+}
 
 // Build-Zeit-Fallbacks falls inject_time.py nicht lief
 #ifndef RTC_BUILD_Y
@@ -360,7 +511,7 @@ static void gt911ResetAddressMode(bool intHigh) {
   delay(200);
   digitalWrite(PIN_TOUCH_INT, intHigh ? HIGH : LOW);
   delay(5);
-  pinMode(PIN_TOUCH_INT, INPUT);
+  pinMode(PIN_TOUCH_INT, INPUT_PULLUP);
   delay(50);
 }
 
@@ -409,6 +560,7 @@ static bool readTouch(uint16_t *x, uint16_t *y) {
     gt911Addr = otherAddr;
     gt911Found = true;
   }
+  g_lastTouchStatus = status;
   if ((status & 0x80) == 0) {
     uint8_t clear = 0;
     i2cRegWrite16(gt911Addr, GT911_READ_XY, &clear, 1);
@@ -431,6 +583,9 @@ static bool readTouch(uint16_t *x, uint16_t *y) {
 
   *x = (uint16_t)point[2] | ((uint16_t)point[3] << 8);
   *y = (uint16_t)point[4] | ((uint16_t)point[5] << 8);
+  g_lastTouchX = *x;
+  g_lastTouchY = *y;
+  g_lastTouchMs = millis();
   return true;
 }
 
@@ -776,10 +931,14 @@ static uint8_t glyphColumn(char c, uint8_t col) {
   switch (c) {
     case 'A': { static const uint8_t v[5] = {0x7E, 0x11, 0x11, 0x11, 0x7E}; g = v; break; }
     case 'B': { static const uint8_t v[5] = {0x7F, 0x49, 0x49, 0x49, 0x36}; g = v; break; }
+    case 'C': { static const uint8_t v[5] = {0x3E, 0x41, 0x41, 0x41, 0x22}; g = v; break; }
     case 'D': { static const uint8_t v[5] = {0x7F, 0x41, 0x41, 0x22, 0x1C}; g = v; break; }
     case 'E': { static const uint8_t v[5] = {0x7F, 0x49, 0x49, 0x49, 0x41}; g = v; break; }
+    case 'F': { static const uint8_t v[5] = {0x7F, 0x09, 0x09, 0x09, 0x01}; g = v; break; }
+    case 'G': { static const uint8_t v[5] = {0x3E, 0x41, 0x49, 0x49, 0x7A}; g = v; break; }
     case 'H': { static const uint8_t v[5] = {0x7F, 0x08, 0x08, 0x08, 0x7F}; g = v; break; }
     case 'I': { static const uint8_t v[5] = {0x00, 0x41, 0x7F, 0x41, 0x00}; g = v; break; }
+    case 'K': { static const uint8_t v[5] = {0x7F, 0x08, 0x14, 0x22, 0x41}; g = v; break; }
     case 'L': { static const uint8_t v[5] = {0x7F, 0x40, 0x40, 0x40, 0x40}; g = v; break; }
     case 'M': { static const uint8_t v[5] = {0x7F, 0x02, 0x0C, 0x02, 0x7F}; g = v; break; }
     case 'N': { static const uint8_t v[5] = {0x7F, 0x04, 0x08, 0x10, 0x7F}; g = v; break; }
@@ -791,6 +950,8 @@ static uint8_t glyphColumn(char c, uint8_t col) {
     case 'T': { static const uint8_t v[5] = {0x01, 0x01, 0x7F, 0x01, 0x01}; g = v; break; }
     case 'U': { static const uint8_t v[5] = {0x3F, 0x40, 0x40, 0x40, 0x3F}; g = v; break; }
     case 'V': { static const uint8_t v[5] = {0x1F, 0x20, 0x40, 0x20, 0x1F}; g = v; break; }
+    case 'W': { static const uint8_t v[5] = {0x3F, 0x40, 0x38, 0x40, 0x3F}; g = v; break; }
+    case 'X': { static const uint8_t v[5] = {0x63, 0x14, 0x08, 0x14, 0x63}; g = v; break; }
     case 'Y': { static const uint8_t v[5] = {0x07, 0x08, 0x70, 0x08, 0x07}; g = v; break; }
     case 'Z': { static const uint8_t v[5] = {0x61, 0x51, 0x49, 0x45, 0x43}; g = v; break; }
     case '-': { static const uint8_t v[5] = {0x08, 0x08, 0x08, 0x08, 0x08}; g = v; break; }
@@ -943,13 +1104,14 @@ static void drawMenuOverview() {
     return;
   }
   fillFrame(RGB565_BLACK);
-  drawCircleLine(240, 240, 232, 3, RGB565(80, 80, 75));
-  drawTextSmall(78, 52, "MENU", RGB565(235, 235, 225), 8);
+  drawCircleLine(240, 240, 216, 3, RGB565(80, 80, 75));
+  drawTextCentered(240, 54, "MENU", RGB565(235, 235, 225), 7);
 
-  drawMenuTile(60, 120, 360, 58, "UHR", RGB565(200, 40, 35));
-  drawMenuTile(60, 190, 360, 58, "MOTOR", RGB565(40, 150, 210));
-  drawMenuTile(60, 260, 360, 58, "LAMBDA", RGB565(60, 185, 90));
-  drawMenuTile(60, 330, 360, 58, "SETUP", RGB565(210, 170, 45));
+  drawMenuTile(88, 116, 304, 46, "UHR", RGB565(200, 40, 35));
+  drawMenuTile(88, 172, 304, 46, "MOTOR", RGB565(40, 150, 210));
+  drawMenuTile(88, 228, 304, 46, "LAMBDA", RGB565(60, 185, 90));
+  drawMenuTile(88, 284, 304, 46, "HUB", RGB565(190, 90, 210));
+  drawMenuTile(88, 340, 304, 46, "SETUP", RGB565(210, 170, 45));
 
   // IP-Adresse im Netz unten anzeigen
   char ipLine[32];
@@ -957,6 +1119,126 @@ static void drawMenuOverview() {
   drawTextCentered(240, 404, ipLine, RGB565(150, 200, 150), 2);
 
   presentFrame();
+}
+
+// Daten gelten als frisch, wenn verbunden und Notify < 3s her.
+static bool bleFresh() {
+  return g_bleConn && (millis() - g_bleLastRx < 3000);
+}
+
+// Eine Datenzeile "LABEL  WERT" zeichnen.
+static void drawDataRow(int y, const char* label, const char* value, uint16_t col) {
+  drawTextSmall(92, y, label, RGB565(160, 160, 160), 2);
+  drawTextSmall(244, y, value, col, 2);
+}
+
+static void drawMotorPage() {
+  if (!ensureFrame()) return;
+  fillFrame(RGB565_BLACK);
+  drawCircleLine(240, 240, 216, 3, RGB565(40, 110, 160));
+  drawTextCentered(240, 52, "MOTOR", RGB565(60, 170, 230), 5);
+
+  bool fresh = bleFresh();
+  char buf[16];
+  uint16_t cv = fresh ? RGB565(235, 235, 225) : RGB565(110, 60, 60);
+  const char* na = "---";
+
+  if (fresh) { snprintf(buf, sizeof(buf), "%d", (int)g_rpm); drawDataRow(112, "RPM", buf, cv); }
+  else drawDataRow(112, "RPM", na, cv);
+  if (fresh) { snprintf(buf, sizeof(buf), "%d", (int)g_adv); drawDataRow(152, "ADV", buf, cv); }
+  else drawDataRow(152, "ADV", na, cv);
+  if (fresh) { snprintf(buf, sizeof(buf), "%d", (int)g_map); drawDataRow(192, "MAP", buf, cv); }
+  else drawDataRow(192, "MAP", na, cv);
+
+  if (fresh && g_g123Valid) { snprintf(buf, sizeof(buf), "%.1fV", g_g123Volt); drawDataRow(238, "123V", buf, cv); }
+  else drawDataRow(238, "123V", na, cv);
+  if (fresh && g_g123Valid) { snprintf(buf, sizeof(buf), "%dC", (int)g_g123Temp); drawDataRow(278, "123T", buf, cv); }
+  else drawDataRow(278, "123T", na, cv);
+  if (fresh && g_battValid) { snprintf(buf, sizeof(buf), "%.1fV", g_battVolt); drawDataRow(318, "BATT", buf, cv); }
+  else drawDataRow(318, "BATT", na, cv);
+
+  const char* st = g_bleConn ? (fresh ? "LIVE" : "WARTE") : "KEIN HUB";
+  drawTextCentered(240, 370, st, g_bleConn && fresh ? RGB565(60, 200, 90) : RGB565(200, 120, 50), 2);
+  presentFrame();
+}
+
+static void drawLambdaPage() {
+  if (!ensureFrame()) return;
+  fillFrame(RGB565_BLACK);
+  drawCircleLine(240, 240, 216, 3, RGB565(45, 150, 70));
+  drawTextCentered(240, 58, "LAMBDA", RGB565(70, 200, 100), 5);
+
+  bool fresh = bleFresh() && g_lambdaValid;
+  char buf[16];
+  if (fresh) snprintf(buf, sizeof(buf), "%.2f", g_lambda);
+  else strcpy(buf, "----");
+  // grosse Lambda-Zahl mittig
+  uint16_t col = RGB565(240, 240, 230);
+  if (fresh) {
+    if (g_lambda < 0.97f) col = RGB565(235, 120, 40);       // fett
+    else if (g_lambda > 1.03f) col = RGB565(80, 160, 240);  // mager
+    else col = RGB565(70, 210, 100);                        // ok
+  } else col = RGB565(110, 60, 60);
+  drawTextCentered(240, 198, buf, col, 8);
+
+  if (fresh && g_speedValid) {
+    char sp[16]; snprintf(sp, sizeof(sp), "%d km/h", (int)g_speedKmh);
+    drawTextCentered(240, 318, sp, RGB565(180, 180, 180), 3);
+  }
+
+  const char* st = g_bleConn ? (bleFresh() ? "LIVE" : "WARTE") : "KEIN HUB";
+  drawTextCentered(240, 370, st, g_bleConn && bleFresh() ? RGB565(60, 200, 90) : RGB565(200, 120, 50), 2);
+  presentFrame();
+}
+
+static void drawHubPage() {
+  if (!ensureFrame()) return;
+  fillFrame(RGB565_BLACK);
+  drawCircleLine(240, 240, 216, 3, RGB565(150, 70, 180));
+  drawTextCentered(240, 54, "HUB", RGB565(205, 120, 230), 5);
+
+  char buf[24];
+  drawDataRow(112, "BLE", g_bleConn ? "OK" : "SCAN", g_bleConn ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
+  snprintf(buf, sizeof(buf), "%lu", (unsigned long)g_bleRxCnt);
+  drawDataRow(152, "RX", buf, RGB565(235, 235, 225));
+  snprintf(buf, sizeof(buf), "%lu MS", g_bleLastRx ? (unsigned long)(millis() - g_bleLastRx) : 0UL);
+  drawDataRow(192, "AGE", buf, RGB565(235, 235, 225));
+  snprintf(buf, sizeof(buf), "%.1f V", g_battVolt);
+  drawDataRow(232, "BATT", g_battValid ? buf : "---", RGB565(235, 235, 225));
+  snprintf(buf, sizeof(buf), "%.0f KMH", g_speedKmh);
+  drawDataRow(272, "SPEED", g_speedValid ? buf : "---", RGB565(235, 235, 225));
+  drawDataRow(312, "IP", g_ipStr, RGB565(150, 200, 150));
+
+  drawTextCentered(240, 370, "TIP MENU", RGB565(180, 180, 170), 2);
+  presentFrame();
+}
+
+static void drawSetupPage() {
+  if (!ensureFrame()) return;
+  fillFrame(RGB565_BLACK);
+  drawCircleLine(240, 240, 216, 3, RGB565(185, 150, 45));
+  drawTextCentered(240, 54, "SETUP", RGB565(230, 190, 70), 5);
+
+  char buf[28];
+  snprintf(buf, sizeof(buf), "%d %%", g_dialScalePct);
+  drawDataRow(112, "UHR", buf, RGB565(235, 235, 225));
+  drawDataRow(152, "TOUCH", touchSeen ? "AKTIV" : "WARTET", touchSeen ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
+  drawDataRow(192, "WIFI", WiFi.status() == WL_CONNECTED ? "OK" : "---", WiFi.status() == WL_CONNECTED ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
+  drawDataRow(232, "IP", g_ipStr, RGB565(150, 200, 150));
+  drawDataRow(272, "BLE", g_bleConn ? "HUB OK" : "SCAN", g_bleConn ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
+  drawDataRow(312, "WEB", "BROWSER", RGB565(150, 200, 150));
+
+  drawTextCentered(240, 370, "TIP MENU", RGB565(180, 180, 170), 2);
+  presentFrame();
+}
+
+static void drawCurrentPage() {
+  if (currentPage == 0) drawVdoClock();
+  else if (currentPage == 1) drawMenuOverview();
+  else if (currentPage == 2) drawMotorPage();
+  else if (currentPage == 3) drawLambdaPage();
+  else if (currentPage == 4) drawHubPage();
+  else if (currentPage == 5) drawSetupPage();
 }
 
 // -------- Einstellungen (Preferences) --------
@@ -997,6 +1279,24 @@ static void handleWebRoot() {
   html += F("<h1>VDO Quartz-Zeit</h1>");
   html += "<div class='card'><div class='big'>" + String(timeStr) + "</div>";
   html += "<div>IP " + String(g_ipStr) + "</div></div>";
+  html += F("<div class='card'><h3>Display-Seite</h3>"
+    "<a href='/page?p=0'><button>Uhr</button></a>"
+    "<a href='/page?p=1'><button>Menu</button></a>"
+    "<a href='/page?p=2'><button>Motor</button></a>"
+    "<a href='/page?p=3'><button>Lambda</button></a>"
+    "<a href='/page?p=4'><button>Hub</button></a>"
+    "<a href='/page?p=5'><button>Setup</button></a></div>");
+  html += F("<div class='card'><h3>Hub Live</h3>");
+  html += "<div>BLE: " + String(g_bleConn ? "verbunden" : "scan") + "</div>";
+  html += "<div>RX: " + String((unsigned long)g_bleRxCnt) + "</div>";
+  html += "<div>Lambda: " + String(g_lambdaValid ? String(g_lambda, 2) : String("---")) + "</div>";
+  html += "<div>RPM: " + String((int)g_rpm) + " &nbsp; ADV: " + String(g_adv, 1) + "</div>";
+  html += "<div>Batt: " + String(g_battValid ? String(g_battVolt, 1) + " V" : String("---")) + "</div></div>";
+  html += F("<div class='card'><h3>Touch</h3>");
+  html += "<div>Chip: " + String(gt911Found ? "GT911 OK" : "nicht gefunden") + " @0x" + String(gt911Addr, HEX) + "</div>";
+  html += "<div>Status: 0x" + String(g_lastTouchStatus, HEX) + "</div>";
+  html += "<div>Letzter Punkt: X " + String(g_lastTouchX) + " / Y " + String(g_lastTouchY) + "</div>";
+  html += "<div>Alter: " + String(g_lastTouchMs ? (millis() - g_lastTouchMs) : 0) + " ms</div></div>";
   html += F("<div class='card'><h3>Zifferblatt-Gr&ouml;&szlig;e</h3>"
     "<form action='/set' method='get'>"
     "<div class='val'><span id='v'>");
@@ -1015,8 +1315,21 @@ static void handleWebRoot() {
 static void handleWebSet() {
   if (webServer.hasArg("scale")) {
     saveDialScale(webServer.arg("scale").toInt());
-    g_redrawClock = true;
+    g_redrawPage = true;
     Serial.printf("Web: Zifferblatt-Groesse = %d%%\n", g_dialScalePct);
+  }
+  webServer.sendHeader("Location", "/");
+  webServer.send(303);
+}
+
+static void handleWebPage() {
+  if (webServer.hasArg("p")) {
+    int page = webServer.arg("p").toInt();
+    if (page < 0) page = 0;
+    if (page > 5) page = 5;
+    currentPage = static_cast<uint8_t>(page);
+    g_redrawPage = true;
+    Serial.printf("Web: page=%u\n", currentPage);
   }
   webServer.sendHeader("Location", "/");
   webServer.send(303);
@@ -1025,6 +1338,7 @@ static void handleWebSet() {
 static void startWebServer() {
   webServer.on("/", handleWebRoot);
   webServer.on("/set", handleWebSet);
+  webServer.on("/page", handleWebPage);
   webServer.begin();
   Serial.println("WebGUI: gestartet auf Port 80");
 }
@@ -1087,6 +1401,13 @@ void setup() {
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     Serial.printf("WiFi: Verbindung zu '%s' im Hintergrund gestartet\n", WIFI_SSID);
   }
+
+  // BLE-Client fuer Spartan3-Hub (Motor-/Lambda-Daten). WiFi-Modem-Sleep
+  // bleibt aktiv (Default) fuer WiFi+BLE-Koexistenz auf dem ESP32-S3.
+  NimBLEDevice::init("VDO-Clock");
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+  bleNextScanAt = millis() + 2000;  // kurz nach Boot ersten Scan starten
+  Serial.println("BLE: Client initialisiert");
 }
 
 void loop() {
@@ -1101,13 +1422,24 @@ void loop() {
     Serial.printf("touch x=%u y=%u page=%u\n", x, y, currentPage);
 
     if (currentPage == 0) {
+      // Uhr -> Menue
       currentPage = 1;
       drawMenuOverview();
       Serial.println("page: menu");
+    } else if (currentPage == 1) {
+      // Menue: Kachel nach y-Position waehlen
+      if (y >= 100 && y < 166) { currentPage = 0; drawVdoClock(); Serial.println("page: clock"); }
+      else if (y >= 166 && y < 222) { currentPage = 2; drawMotorPage(); Serial.println("page: motor"); }
+      else if (y >= 222 && y < 278) { currentPage = 3; drawLambdaPage(); Serial.println("page: lambda"); }
+      else if (y >= 278 && y < 334) { currentPage = 4; drawHubPage(); Serial.println("page: hub"); }
+      else if (y >= 334 && y < 405) { currentPage = 5; drawSetupPage(); Serial.println("page: setup"); }
+      else { currentPage = 2; drawMotorPage(); Serial.println("page: motor fallback"); }
     } else {
-      currentPage = 0;
-      drawVdoClock();
-      Serial.println("page: clock");
+      // Daten-Seiten: einfacher Blaettermodus, unabhaengig von Touch-Koordinaten.
+      currentPage++;
+      if (currentPage > 5) currentPage = 0;
+      drawCurrentPage();
+      Serial.printf("page: next %u\n", currentPage);
     }
   }
 
@@ -1116,20 +1448,29 @@ void loop() {
     drawVdoClock();
   }
 
+  // BLE-Client (Spartan-Hub) nicht-blockierend bedienen
+  bleTick();
+
   // Web-GUI bedienen
   if (WiFi.status() == WL_CONNECTED) {
     webServer.handleClient();
   }
 
   // Neuzeichnen nach Web-Aenderung (z.B. Zifferblatt-Groesse)
-  if (g_redrawClock) {
+  if (g_redrawClock || g_redrawPage) {
     g_redrawClock = false;
-    if (currentPage == 0) drawVdoClock();
+    g_redrawPage = false;
+    drawCurrentPage();
   }
 
   if (currentPage == 0 && millis() - lastClockDraw >= 1000) {
     lastClockDraw = millis();
     drawVdoClock();
+  }
+  // Daten-Seiten live aktualisieren (2x/s)
+  if ((currentPage == 2 || currentPage == 3 || currentPage == 4 || currentPage == 5) && millis() - lastClockDraw >= 500) {
+    lastClockDraw = millis();
+    drawCurrentPage();
   }
 
   delay(10);
