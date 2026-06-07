@@ -95,7 +95,11 @@ static uint32_t g_lastTouchMs = 0;
 static char g_ipStr[20] = "---";   // IP-Adresse fuers Menue
 static int  g_dialScalePct = 100;  // Zifferblatt-Groesse in % (50..100)
 static int  g_brightnessPct = 100; // LCD-Helligkeit in % (5..100)
-static uint8_t g_rotation = 0;      // Display-Rotation: 0,1,2,3 = 0/90/180/270 Grad
+static int  g_rotationDeg = 0;      // Display-Rotation in Grad (0..359)
+static String g_wifiSsid = "";
+static String g_wifiPassword = "";
+static bool g_wifiSaved = false;
+static bool g_webStarted = false;
 static bool g_redrawClock = false; // Flag: Uhr neu zeichnen (z.B. nach Web-Aenderung)
 static bool g_redrawPage = false;  // Flag: aktuelle Display-Seite neu zeichnen
 static WebServer webServer(80);
@@ -351,15 +355,15 @@ static bool wifiNtpTick() {
   static bool ntpSynced = false;
   static uint32_t lastTry = 0;
 
-  if (strlen(WIFI_SSID) == 0) return false;
+  if (g_wifiSsid.length() == 0) return false;
 
   if (WiFi.status() != WL_CONNECTED) {
     // alle 30s erneut versuchen
     if (millis() - lastTry > 30000) {
       lastTry = millis();
       WiFi.disconnect();
-      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-      Serial.println("WiFi: Reconnect-Versuch");
+      WiFi.begin(g_wifiSsid.c_str(), g_wifiPassword.c_str());
+      Serial.printf("WiFi: Reconnect-Versuch zu '%s'\n", g_wifiSsid.c_str());
     }
     if (g_ipStr[0] == '-') strcpy(g_ipStr, "...");
     return false;
@@ -367,15 +371,10 @@ static bool wifiNtpTick() {
 
   // Verbunden -> IP merken
   static char lastIp[20] = "";
-  static bool webStarted = false;
   snprintf(g_ipStr, sizeof(g_ipStr), "%s", WiFi.localIP().toString().c_str());
   if (strcmp(lastIp, g_ipStr) != 0) {
     strcpy(lastIp, g_ipStr);
     Serial.printf("WiFi verbunden, IP: %s\n", g_ipStr);
-  }
-  if (!webStarted) {
-    startWebServer();
-    webStarted = true;
   }
 
   if (!sntpStarted) {
@@ -794,7 +793,9 @@ static bool ensureFrame() {
 
 static void presentFrame() {
   if (nativeFrame && nativePanel) {
-    if (g_rotation == 0) {
+    int rot = g_rotationDeg % 360;
+    if (rot < 0) rot += 360;
+    if (rot == 0) {
       esp_lcd_panel_draw_bitmap(nativePanel, 0, 0, 480, 480, nativeFrame);
       return;
     }
@@ -806,16 +807,18 @@ static void presentFrame() {
       esp_lcd_panel_draw_bitmap(nativePanel, 0, 0, 480, 480, nativeFrame);
       return;
     }
+    const float rad = rot * PI / 180.0f;
+    const float ca = cosf(rad);
+    const float sa = sinf(rad);
+    constexpr float center = 239.5f;
     for (int y = 0; y < 480; y++) {
+      const float dy = y - center;
       for (int x = 0; x < 480; x++) {
-        const uint16_t c = nativeFrame[y * 480 + x];
-        if (g_rotation == 1) {
-          presentFrameBuf[x * 480 + (479 - y)] = c;
-        } else if (g_rotation == 2) {
-          presentFrameBuf[(479 - y) * 480 + (479 - x)] = c;
-        } else {
-          presentFrameBuf[(479 - x) * 480 + y] = c;
-        }
+        const float dx = x - center;
+        const int sx = static_cast<int>(ca * dx + sa * dy + center + 0.5f);
+        const int sy = static_cast<int>(-sa * dx + ca * dy + center + 0.5f);
+        presentFrameBuf[y * 480 + x] =
+            ((unsigned)sx < 480 && (unsigned)sy < 480) ? nativeFrame[sy * 480 + sx] : RGB565_BLACK;
       }
     }
     esp_lcd_panel_draw_bitmap(nativePanel, 0, 0, 480, 480, presentFrameBuf);
@@ -1251,7 +1254,7 @@ static void drawSetupPage() {
   drawDataRow(112, "UHR", buf, RGB565(235, 235, 225));
   snprintf(buf, sizeof(buf), "%d %%", g_brightnessPct);
   drawDataRow(152, "HELL", buf, RGB565(235, 235, 225));
-  snprintf(buf, sizeof(buf), "%u DEG", g_rotation * 90);
+  snprintf(buf, sizeof(buf), "%d DEG", g_rotationDeg);
   drawDataRow(192, "ROT", buf, RGB565(235, 235, 225));
   drawDataRow(232, "TOUCH", touchSeen ? "AKTIV" : "WARTET", touchSeen ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
   drawDataRow(272, "WIFI", WiFi.status() == WL_CONNECTED ? "OK" : "---", WiFi.status() == WL_CONNECTED ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
@@ -1276,13 +1279,21 @@ static void loadSettings() {
   p.begin("clock", true);
   g_dialScalePct = p.getInt("scale", 100);
   g_brightnessPct = p.getInt("bright", 100);
-  g_rotation = static_cast<uint8_t>(p.getUChar("rot", 0));
+  g_rotationDeg = p.getInt("rotdeg", p.getUChar("rot", 0) * 90);
   p.end();
   if (g_dialScalePct < 30) g_dialScalePct = 30;
   if (g_dialScalePct > 100) g_dialScalePct = 100;
   if (g_brightnessPct < 5) g_brightnessPct = 5;
   if (g_brightnessPct > 100) g_brightnessPct = 100;
-  if (g_rotation > 3) g_rotation = 0;
+  g_rotationDeg %= 360;
+  if (g_rotationDeg < 0) g_rotationDeg += 360;
+
+  Preferences wifi;
+  wifi.begin("wifi", true);
+  g_wifiSsid = wifi.getString("ssid", WIFI_SSID);
+  g_wifiPassword = wifi.getString("pass", WIFI_PASSWORD);
+  g_wifiSaved = wifi.isKey("ssid");
+  wifi.end();
 }
 
 static void saveDialScale(int pct) {
@@ -1315,14 +1326,37 @@ static void saveBrightness(int pct) {
   applyBrightness();
 }
 
-static void saveRotation(int rot) {
-  if (rot < 0) rot = 0;
-  if (rot > 3) rot = 3;
-  g_rotation = static_cast<uint8_t>(rot);
+static void saveRotation(int deg) {
+  deg %= 360;
+  if (deg < 0) deg += 360;
+  g_rotationDeg = deg;
   Preferences p;
   p.begin("clock", false);
-  p.putUChar("rot", g_rotation);
+  p.putInt("rotdeg", g_rotationDeg);
   p.end();
+}
+
+static void saveWifi(const String &ssid, const String &password) {
+  g_wifiSsid = ssid;
+  g_wifiPassword = password;
+  g_wifiSaved = ssid.length() > 0;
+  Preferences p;
+  p.begin("wifi", false);
+  if (g_wifiSaved) {
+    p.putString("ssid", g_wifiSsid);
+    p.putString("pass", g_wifiPassword);
+  } else {
+    p.clear();
+  }
+  p.end();
+  WiFi.disconnect();
+  if (g_wifiSsid.length() > 0) {
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.begin(g_wifiSsid.c_str(), g_wifiPassword.c_str());
+    snprintf(g_ipStr, sizeof(g_ipStr), "...");
+  } else {
+    snprintf(g_ipStr, sizeof(g_ipStr), "---");
+  }
 }
 
 // -------- Web-GUI --------
@@ -1361,6 +1395,23 @@ static void handleWebRoot() {
   html += "<div>Status: 0x" + String(g_lastTouchStatus, HEX) + "</div>";
   html += "<div>Letzter Punkt: X " + String(g_lastTouchX) + " / Y " + String(g_lastTouchY) + "</div>";
   html += "<div>Alter: " + String(g_lastTouchMs ? (millis() - g_lastTouchMs) : 0) + " ms</div></div>";
+  html += F("<div class='card'><h3>WLAN</h3>");
+  html += "<div>STA: " + String(WiFi.status() == WL_CONNECTED ? WiFi.SSID() + " / " + WiFi.localIP().toString() : String("nicht verbunden")) + "</div>";
+  html += "<div>Gespeichert: " + String(g_wifiSaved ? g_wifiSsid : String("-")) + "</div>";
+  html += "<div>Setup-AP: VDO-Clock-Setup / " + WiFi.softAPIP().toString() + "</div>";
+  html += F("<form action='/wifi' method='get'>"
+    "<p><select id='wifiPreset'>"
+    "<option value='' data-pass=''>Manuell</option>"
+    "<option value='Android-AP1' data-pass='Frankfurt1'>S24 Hotspot Android-AP1</option>"
+    "<option value='Z00-Station' data-pass=''>Z00-Station</option>"
+    "</select></p>"
+    "<p><input id='ssid' name='ssid' placeholder='SSID' style='width:88%;padding:10px' value='");
+  html += g_wifiSsid;
+  html += F("'></p><p><input id='pass' name='pass' placeholder='Passwort' type='password' style='width:88%;padding:10px'></p>"
+    "<button type='submit'>WLAN speichern</button></form>"
+    "<form action='/wifi_clear' method='get'><button type='submit'>WLAN loeschen</button></form>"
+    "<script>document.getElementById('wifiPreset').addEventListener('change',e=>{let o=e.target.selectedOptions[0];document.getElementById('ssid').value=o.value||'';document.getElementById('pass').value=o.dataset.pass||'';});</script>"
+    "</div>");
   html += F("<div class='card'><h3>Zifferblatt-Gr&ouml;&szlig;e</h3>"
     "<form action='/set' method='get'>"
     "<div class='val'><span id='v'>");
@@ -1384,11 +1435,14 @@ static void handleWebRoot() {
     "<div><a href='/set?bright=100'>100%</a> &middot; <a href='/set?bright=70'>70%</a> &middot; "
     "<a href='/set?bright=40'>40%</a> &middot; <a href='/set?bright=15'>15%</a></div></div>");
   html += F("<div class='card'><h3>Rotation</h3>");
-  html += "<div class='val'>" + String(g_rotation * 90) + "&deg;</div>";
-  html += F("<a href='/set?rot=0'><button>0&deg;</button></a>"
-    "<a href='/set?rot=1'><button>90&deg;</button></a>"
-    "<a href='/set?rot=2'><button>180&deg;</button></a>"
-    "<a href='/set?rot=3'><button>270&deg;</button></a></div>");
+  html += F("<form action='/set' method='get'><div class='val'><span id='r'>");
+  html += String(g_rotationDeg);
+  html += F("</span>&deg;</div><input type='range' name='rot' min='0' max='359' step='1' value='");
+  html += String(g_rotationDeg);
+  html += F("' oninput=\"document.getElementById('r').innerText=this.value\">"
+    "<br><button type='submit'>&Uuml;bernehmen</button></form>"
+    "<div><a href='/set?rot=0'>0&deg;</a> &middot; <a href='/set?rot=90'>90&deg;</a> &middot; "
+    "<a href='/set?rot=180'>180&deg;</a> &middot; <a href='/set?rot=270'>270&deg;</a></div></div>");
   html += F("<p style='color:#666'>VW T2b Cockpit &middot; ESP32-S3 2.8\"</p></body></html>");
   webServer.send(200, "text/html", html);
 }
@@ -1407,8 +1461,25 @@ static void handleWebSet() {
   if (webServer.hasArg("rot")) {
     saveRotation(webServer.arg("rot").toInt());
     g_redrawPage = true;
-    Serial.printf("Web: Rotation = %u deg\n", g_rotation * 90);
+    Serial.printf("Web: Rotation = %d deg\n", g_rotationDeg);
   }
+  webServer.sendHeader("Location", "/");
+  webServer.send(303);
+}
+
+static void handleWebWifi() {
+  String ssid = webServer.arg("ssid");
+  String pass = webServer.arg("pass");
+  ssid.trim();
+  saveWifi(ssid, pass);
+  Serial.printf("Web: WLAN gespeichert '%s'\n", g_wifiSsid.c_str());
+  webServer.sendHeader("Location", "/");
+  webServer.send(303);
+}
+
+static void handleWebWifiClear() {
+  saveWifi("", "");
+  Serial.println("Web: WLAN geloescht");
   webServer.sendHeader("Location", "/");
   webServer.send(303);
 }
@@ -1430,7 +1501,10 @@ static void startWebServer() {
   webServer.on("/", handleWebRoot);
   webServer.on("/set", handleWebSet);
   webServer.on("/page", handleWebPage);
+  webServer.on("/wifi", handleWebWifi);
+  webServer.on("/wifi_clear", handleWebWifiClear);
   webServer.begin();
+  g_webStarted = true;
   Serial.println("WebGUI: gestartet auf Port 80");
 }
 
@@ -1486,13 +1560,15 @@ void setup() {
   drawVdoClock();
   Serial.println("VDO clock drawn.");
 
-  // WiFi-Verbindung im Hintergrund starten (nicht-blockierend). NTP-Sync
-  // und IP-Anzeige passieren im loop() sobald die Verbindung steht, ohne
-  // den Boot oder die Uhr aufzuhalten. Retry laeuft automatisch weiter.
-  if (strlen(WIFI_SSID) > 0) {
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    Serial.printf("WiFi: Verbindung zu '%s' im Hintergrund gestartet\n", WIFI_SSID);
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP("VDO-Clock-Setup", "vdoclock");
+  Serial.printf("Setup-AP: VDO-Clock-Setup / %s\n", WiFi.softAPIP().toString().c_str());
+  startWebServer();
+
+  // WiFi-Verbindung im Hintergrund starten. NTP/IP laufen im loop() weiter.
+  if (g_wifiSsid.length() > 0) {
+    WiFi.begin(g_wifiSsid.c_str(), g_wifiPassword.c_str());
+    Serial.printf("WiFi: Verbindung zu '%s' im Hintergrund gestartet\n", g_wifiSsid.c_str());
   }
 
   // BLE-Client fuer Spartan3-Hub (Motor-/Lambda-Daten). WiFi-Modem-Sleep
@@ -1514,17 +1590,25 @@ void loop() {
     touchSeen = true;
     const uint16_t rawX = x;
     const uint16_t rawY = y;
-    if (g_rotation == 1) {
-      x = rawY;
-      y = 479 - rawX;
-    } else if (g_rotation == 2) {
-      x = 479 - rawX;
-      y = 479 - rawY;
-    } else if (g_rotation == 3) {
-      x = 479 - rawY;
-      y = rawX;
+    int rot = g_rotationDeg % 360;
+    if (rot < 0) rot += 360;
+    if (rot != 0) {
+      const float rad = rot * PI / 180.0f;
+      const float ca = cosf(rad);
+      const float sa = sinf(rad);
+      constexpr float center = 239.5f;
+      const float dx = rawX - center;
+      const float dy = rawY - center;
+      int lx = static_cast<int>(ca * dx + sa * dy + center + 0.5f);
+      int ly = static_cast<int>(-sa * dx + ca * dy + center + 0.5f);
+      if (lx < 0) lx = 0;
+      if (lx > 479) lx = 479;
+      if (ly < 0) ly = 0;
+      if (ly > 479) ly = 479;
+      x = static_cast<uint16_t>(lx);
+      y = static_cast<uint16_t>(ly);
     }
-    Serial.printf("touch raw=%u/%u logical=%u/%u rot=%u page=%u\n", rawX, rawY, x, y, g_rotation * 90, currentPage);
+    Serial.printf("touch raw=%u/%u logical=%u/%u rot=%d page=%u\n", rawX, rawY, x, y, g_rotationDeg, currentPage);
 
     if (currentPage == 0) {
       // Uhr -> Menue
@@ -1557,7 +1641,7 @@ void loop() {
   bleTick();
 
   // Web-GUI bedienen
-  if (WiFi.status() == WL_CONNECTED) {
+  if (g_webStarted) {
     webServer.handleClient();
   }
 
