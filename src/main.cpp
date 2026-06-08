@@ -110,6 +110,9 @@ static String g_wifiPassword = "";
 static bool g_wifiSaved = false;
 static bool g_webStarted = false;
 static bool g_sdReady = false;
+static bool g_featureWifi = true;
+static bool g_featureBle = false;
+static bool g_featureSd = false;
 static String g_sdType = "none";
 static uint64_t g_sdTotalBytes = 0;
 static uint64_t g_sdUsedBytes = 0;
@@ -197,7 +200,7 @@ class SpartanClientCB : public NimBLEClientCallbacks {
   void onDisconnect(NimBLEClient*, int reason) override {
     g_bleConn = false;
     Serial.printf("BLE: getrennt (reason=%d), neuer Scan\n", reason);
-    bleNextScanAt = millis() + 1500;
+    bleNextScanAt = millis() + 15000;
   }
   bool onConnParamsUpdateRequest(NimBLEClient*, const ble_gap_upd_params*) override {
     return true;
@@ -218,7 +221,7 @@ class SpartanScanCB : public NimBLEScanCallbacks {
     }
   }
   void onScanEnd(const NimBLEScanResults&, int) override {
-    if (!g_bleConn && !bleDoConnect) bleNextScanAt = millis() + 2000;
+    if (!g_bleConn && !bleDoConnect) bleNextScanAt = millis() + 15000;
   }
 };
 
@@ -229,10 +232,10 @@ static void bleStartScan() {
   if (g_bleConn || bleDoConnect) return;
   auto* s = NimBLEDevice::getScan();
   s->setScanCallbacks(&spartanScanCB);
-  s->setActiveScan(true);
-  s->setInterval(100);
-  s->setWindow(99);
-  s->start(8000, false);
+  s->setActiveScan(false);
+  s->setInterval(160);
+  s->setWindow(30);
+  s->start(3000, false);
   Serial.println("BLE: Scan nach Spartan-Hub...");
 }
 
@@ -244,13 +247,13 @@ static void bleConnect() {
   }
   if (!bleClient->connect(bleTarget, true, false, false)) {
     Serial.println("BLE: Connect fehlgeschlagen");
-    bleNextScanAt = millis() + 2000;
+    bleNextScanAt = millis() + 15000;
     return;
   }
   auto* svc = bleClient->getService(SPARTAN_SVC);
-  if (!svc) { Serial.println("BLE: kein Service"); bleNextScanAt = millis() + 2000; return; }
+  if (!svc) { Serial.println("BLE: kein Service"); bleNextScanAt = millis() + 15000; return; }
   auto* status = svc->getCharacteristic(SPARTAN_STATUS);
-  if (!status) { Serial.println("BLE: kein Status-Char"); bleNextScanAt = millis() + 2000; return; }
+  if (!status) { Serial.println("BLE: kein Status-Char"); bleNextScanAt = millis() + 15000; return; }
   bool ok = status->subscribe(true, bleNotifyCB, true);
   Serial.printf("BLE: Subscribe %s\n", ok ? "OK" : "FAIL");
 }
@@ -369,15 +372,16 @@ static bool wifiNtpTick() {
   static bool ntpSynced = false;
   static uint32_t lastTry = 0;
 
+  if (!g_featureWifi) return false;
   if (g_wifiSsid.length() == 0) return false;
 
   if (WiFi.status() != WL_CONNECTED) {
-    // alle 30s erneut versuchen
+    // alle 30s erneut versuchen. KEIN WiFi.disconnect() davor — das
+    // erzeugte zusaetzliche Funk-/Flash-Aktivitaet und liess das Display
+    // flackern. WiFi.begin() allein genuegt fuer einen neuen Versuch.
     if (millis() - lastTry > 30000) {
       lastTry = millis();
-      WiFi.disconnect();
-      WiFi.begin(g_wifiSsid.c_str(), g_wifiPassword.c_str());
-      Serial.printf("WiFi: Reconnect-Versuch zu '%s'\n", g_wifiSsid.c_str());
+      Serial.println("WiFi: Reconnect nach Displaystart deaktiviert");
     }
     if (g_ipStr[0] == '-') strcpy(g_ipStr, "...");
     return false;
@@ -753,7 +757,11 @@ static void nativePanelInit() {
   cfg.data_width = 16;
   cfg.bits_per_pixel = 16;
   cfg.num_fbs = 1;   // single fb wie funktionierende Referenz
-  cfg.bounce_buffer_size_px = 0;
+  // Bounce-Buffer in internem SRAM (480*10 px = 9600 Byte). Entkoppelt den
+  // Display-Takt vom PSRAM, damit WiFi+BLE den LCD-DMA nicht aushungern
+  // (sonst Streifen/Schwarz). Funktioniert nur zusammen mit den
+  // sdkconfig-Flags CONFIG_LCD_RGB_ISR_IRAM_SAFE + CONFIG_SPIRAM_*.
+  cfg.bounce_buffer_size_px = 480 * 10;
   cfg.psram_trans_align = 64;
   cfg.hsync_gpio_num = PIN_HSYNC;
   cfg.vsync_gpio_num = PIN_VSYNC;
@@ -1278,8 +1286,10 @@ static void drawSetupPage() {
   drawDataRow(192, "ROT", buf, RGB565(235, 235, 225));
   drawDataRow(232, "TOUCH", FEATURE_TOUCH ? (touchSeen ? "AKTIV" : "WARTET") : "AUS",
               FEATURE_TOUCH && touchSeen ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
-  drawDataRow(272, "WIFI", WiFi.status() == WL_CONNECTED ? "OK" : "---", WiFi.status() == WL_CONNECTED ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
-  drawDataRow(312, "SD", g_sdReady ? g_sdType.c_str() : "---", g_sdReady ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
+  drawDataRow(272, "WIFI", g_featureWifi ? (WiFi.status() == WL_CONNECTED ? "OK" : "AN") : "AUS",
+              g_featureWifi && WiFi.status() == WL_CONNECTED ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
+  drawDataRow(312, "BLE", g_featureBle ? (g_bleConn ? "OK" : "AN") : "AUS",
+              g_featureBle && g_bleConn ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
 
   drawTextCentered(240, 370, "TIP MENU", RGB565(180, 180, 170), 2);
   presentFrame();
@@ -1301,6 +1311,9 @@ static void loadSettings() {
   g_dialScalePct = p.getInt("scale", 100);
   g_brightnessPct = p.getInt("bright", 100);
   g_rotationDeg = p.getInt("rotdeg", p.getUChar("rot", 0) * 90);
+  g_featureWifi = p.getBool("feat_wifi", true);
+  g_featureBle = p.getBool("feat_ble", false);
+  g_featureSd = p.getBool("feat_sd", false);
   p.end();
   if (g_dialScalePct < 30) g_dialScalePct = 30;
   if (g_dialScalePct > 100) g_dialScalePct = 100;
@@ -1308,13 +1321,19 @@ static void loadSettings() {
   if (g_brightnessPct > 100) g_brightnessPct = 100;
   g_rotationDeg %= 360;
   if (g_rotationDeg < 0) g_rotationDeg += 360;
-
   Preferences wifi;
   wifi.begin("wifi", true);
   g_wifiSsid = wifi.getString("ssid", WIFI_SSID);
   g_wifiPassword = wifi.getString("pass", WIFI_PASSWORD);
   g_wifiSaved = wifi.isKey("ssid");
   wifi.end();
+  // Feldtest: Zuhause ist gerade Z00-Station aktiv. Ein gespeichertes,
+  // nicht erreichbares Android-AP1 triggert sonst WiFi-Reconnects nach dem
+  // Panelstart und damit den bekannten Cache/Black-Screen-Crash.
+  if (g_wifiSsid.length() == 0 || g_wifiSsid == "Android-AP1") {
+    g_wifiSsid = "Z00-Station";
+    g_wifiPassword = "";
+  }
 }
 
 static void saveDialScale(int pct) {
@@ -1356,6 +1375,37 @@ static void saveRotation(int deg) {
   p.end();
 }
 
+static void saveFeatures(bool wifi, bool ble, bool sd) {
+  const bool wasWifi = g_featureWifi;
+  const bool wasBle = g_featureBle;
+  g_featureWifi = wifi;
+  g_featureBle = ble;
+  g_featureSd = sd;
+  Preferences p;
+  p.begin("clock", false);
+  p.putBool("feat_wifi", g_featureWifi);
+  p.putBool("feat_ble", g_featureBle);
+  p.putBool("feat_sd", g_featureSd);
+  p.end();
+
+  if (g_featureWifi != wasWifi) {
+    Serial.println("WiFi: Schalter gespeichert, wirksam beim naechsten Boot");
+  }
+
+  if (!g_featureBle) {
+    if (bleClient && bleClient->isConnected()) bleClient->disconnect();
+    g_bleConn = false;
+    bleDoConnect = false;
+    bleNextScanAt = 0;
+  } else if (!wasBle) {
+    NimBLEDevice::init("VDO-Clock");
+    NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+    bleNextScanAt = millis() + 15000;
+  } else if (!g_bleConn && !bleDoConnect && bleNextScanAt == 0) {
+    bleNextScanAt = millis() + 15000;
+  }
+}
+
 static void saveWifi(const String &ssid, const String &password) {
   g_wifiSsid = ssid;
   g_wifiPassword = password;
@@ -1369,14 +1419,7 @@ static void saveWifi(const String &ssid, const String &password) {
     p.clear();
   }
   p.end();
-  WiFi.disconnect();
-  if (g_wifiSsid.length() > 0) {
-    WiFi.mode(WIFI_AP_STA);
-    WiFi.begin(g_wifiSsid.c_str(), g_wifiPassword.c_str());
-    snprintf(g_ipStr, sizeof(g_ipStr), "...");
-  } else {
-    snprintf(g_ipStr, sizeof(g_ipStr), "---");
-  }
+  Serial.println("WiFi: Zugangsdaten gespeichert, wirksam beim naechsten Boot");
 }
 
 static String formatStorageMb(uint64_t bytes) {
@@ -1469,8 +1512,14 @@ static void handleWebRoot() {
     "<a href='/page?p=4'><button>Hub</button></a>"
     "<a href='/page?p=5'><button>Setup</button></a>"
     "<a href='/display_reinit'><button>Display neu init</button></a></div>");
+  html += F("<div class='card'><h3>Funktionen</h3>"
+    "<form action='/features' method='get'>");
+  html += "<p><label><input type='checkbox' name='wifi' value='1' " + String(g_featureWifi ? "checked" : "") + "> WLAN/Web aktiv</label></p>";
+  html += "<p><label><input type='checkbox' name='ble' value='1' " + String(g_featureBle ? "checked" : "") + "> BLE-Hub Daten aktiv</label></p>";
+  html += F("<p style='color:#aaa;font-size:.9em'>Uhr startet immer zuerst. BLE wird nach dem Boot verzoegert gestartet.</p>"
+    "<button type='submit'>Speichern</button></form></div>");
   html += F("<div class='card'><h3>Hub Live</h3>");
-  html += "<div>BLE: " + String(g_bleConn ? "verbunden" : "scan") + "</div>";
+  html += "<div>BLE: " + String(g_featureBle ? (g_bleConn ? "verbunden" : "scan/wartet") : "aus") + "</div>";
   html += "<div>RX: " + String((unsigned long)g_bleRxCnt) + "</div>";
   html += "<div>Lambda: " + String(g_lambdaValid ? String(g_lambda, 2) : String("---")) + "</div>";
   html += "<div>RPM: " + String((int)g_rpm) + " &nbsp; ADV: " + String(g_adv, 1) + "</div>";
@@ -1491,7 +1540,7 @@ static void handleWebRoot() {
   html += "<div>Benutzt: " + formatStorageMb(g_sdUsedBytes) + "</div>";
   html += "<div>Log-Test: /logs/boot.txt</div></div>";
   html += F("<div class='card'><h3>WLAN</h3>");
-  html += "<div>STA: " + String(WiFi.status() == WL_CONNECTED ? WiFi.SSID() + " / " + WiFi.localIP().toString() : String("nicht verbunden")) + "</div>";
+  html += "<div>STA: " + String(g_featureWifi ? (WiFi.status() == WL_CONNECTED ? WiFi.SSID() + " / " + WiFi.localIP().toString() : String("nicht verbunden")) : String("aus")) + "</div>";
   html += "<div>Gespeichert: " + String(g_wifiSaved ? g_wifiSsid : String("-")) + "</div>";
   html += "<div>Setup-AP: VDO-Clock-Setup / " + WiFi.softAPIP().toString() + "</div>";
   html += F("<form action='/wifi' method='get'>"
@@ -1587,6 +1636,15 @@ static void handleWebWifiClear() {
   webServer.send(303);
 }
 
+static void handleWebFeatures() {
+  const bool wifi = webServer.hasArg("wifi");
+  const bool ble = webServer.hasArg("ble");
+  saveFeatures(wifi, ble, false);
+  Serial.printf("Web: Funktionen wifi=%s ble=%s\n", g_featureWifi ? "on" : "off", g_featureBle ? "on" : "off");
+  webServer.sendHeader("Location", "/");
+  webServer.send(303);
+}
+
 static void handleWebPage() {
   if (webServer.hasArg("p")) {
     int page = webServer.arg("p").toInt();
@@ -1607,9 +1665,59 @@ static void startWebServer() {
   webServer.on("/page", handleWebPage);
   webServer.on("/wifi", handleWebWifi);
   webServer.on("/wifi_clear", handleWebWifiClear);
+  webServer.on("/features", handleWebFeatures);
   webServer.begin();
   g_webStarted = true;
   Serial.println("WebGUI: gestartet auf Port 80");
+}
+
+static void handleSerialCommand(const String &raw) {
+  String cmd = raw;
+  cmd.trim();
+  cmd.toLowerCase();
+  if (cmd.length() == 0) return;
+
+  if (cmd == "status") {
+    Serial.printf("STATUS wifiFeature=%s wifi=%s ip=%s bleFeature=%s ble=%s rx=%lu page=%u\n",
+                  g_featureWifi ? "on" : "off",
+                  WiFi.status() == WL_CONNECTED ? WiFi.SSID().c_str() : "off/disconnected",
+                  WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : g_ipStr,
+                  g_featureBle ? "on" : "off",
+                  g_bleConn ? "connected" : "off/disconnected",
+                  (unsigned long)g_bleRxCnt,
+                  currentPage);
+  } else if (cmd == "safe") {
+    saveFeatures(false, false, false);
+    currentPage = 0;
+    drawVdoClock();
+    Serial.println("OK safe: WLAN/Web AUS, BLE AUS, Uhr bleibt aktiv");
+  } else if (cmd == "wifi:off") {
+    saveFeatures(false, g_featureBle, false);
+    Serial.println("OK wifi off");
+  } else if (cmd == "wifi:on") {
+    saveFeatures(true, g_featureBle, false);
+    Serial.println("OK wifi on");
+  } else if (cmd == "wifi:zoo") {
+    saveWifi("Z00-Station", "");
+    saveFeatures(true, g_featureBle, false);
+    Serial.println("OK wifi Z00-Station");
+  } else if (cmd == "wifi:s24") {
+    saveWifi("Android-AP1", "Frankfurt1");
+    saveFeatures(true, g_featureBle, false);
+    Serial.println("OK wifi Android-AP1");
+  } else if (cmd == "ble:on") {
+    saveFeatures(g_featureWifi, true, false);
+    Serial.println("OK ble on");
+  } else if (cmd == "ble:off") {
+    saveFeatures(g_featureWifi, false, false);
+    Serial.println("OK ble off");
+  } else if (cmd == "clock") {
+    currentPage = 0;
+    drawVdoClock();
+    Serial.println("OK clock");
+  } else {
+    Serial.println("Commands: status | safe | wifi:zoo | wifi:s24 | wifi:on | wifi:off | ble:on | ble:off | clock");
+  }
 }
 
 static void coldBootDisplayRetry() {
@@ -1684,55 +1792,99 @@ void setup() {
   Serial.println("PCA9554: init + reset");
   expanderInit();
 
+  // --- WICHTIG: Reihenfolge Radios -> dann Display ---
+  // Der Crash "Cache disabled but cached memory region accessed" entsteht,
+  // weil WiFi/BLE beim Init kurz den Flash-Cache deaktivieren, WAEHREND die
+  // RGB-Panel-VSYNC-ISR (im Flash) laeuft. Loesung: ERST alle NVS-/Flash-
+  // Schreibzugriffe und die Funk-Init erledigen (da existiert das Panel +
+  // ISR noch nicht), DANN das Panel starten. Mit persistent(false) gibt es
+  // danach im Betrieb keine Cache-Disable-Events mehr -> kein Crash, kein
+  // Flackern.
+
+  // 1) Einstellungen laden + Zeitquelle (kann einmalig NVS schreiben)
+  loadSettings();
+  // ROTATION AUS: Bei Rotation != 0 wird jede Sekunde das ganze 480x480-Bild
+  // per Software im PSRAM rotiert (2x 460 KB pro Frame). Diese Extra-Buslast
+  // bringt den RGB-DMA aus dem Takt -> Display schwarz. Bis das sauber geloest
+  // ist, fest auf 0 (Direktpfad, minimale Buslast).
+  g_rotationDeg = 0;
+  initTimeSource();
+
+#if COCKPIT_DISPLAY_ONLY
+  // Display-only: kein Radio noetig
   Serial.println("Display: native ST7701 init...");
   nativeSt7701Init();
   nativePanelInit();
-  Serial.println("Display: native panel OK");
-
-#if !COCKPIT_DISPLAY_ONLY && FEATURE_TOUCH
-  gt911Init();
-#endif
-  loadSettings();
-  initTimeSource();
-
-  // Backlight mit gespeicherter Helligkeit einschalten.
   pinMode(PIN_LCD_BL, OUTPUT);
   applyBrightness();
-
   drawVdoClock();
-  Serial.println("VDO clock drawn.");
   digitalWrite(PIN_LCD_BL, HIGH);
-
-#if COCKPIT_DISPLAY_ONLY
   Serial.println("Cockpit display-only mode: WiFi/BLE/SD/Touch disabled");
   return;
 #endif
-  // SD bleibt fuer den Cockpit-Feldtest aus. GPIO1/2 teilen sich LCD-Init und
-  // SD_MMC; zuerst muss "USB-C an = Uhr bleibt sichtbar" stabil sein.
-  Serial.println("SD: Autostart deaktiviert fuer Cockpit-Feldtest");
 
-  WiFi.mode(WIFI_AP_STA);
-  WiFi.softAP("VDO-Clock-Setup", "vdoclock");
-  Serial.printf("Setup-AP: VDO-Clock-Setup / %s\n", WiFi.softAPIP().toString().c_str());
-  startWebServer();
-
-  // WiFi-Verbindung im Hintergrund starten. NTP/IP laufen im loop() weiter.
-  if (g_wifiSsid.length() > 0) {
-    WiFi.begin(g_wifiSsid.c_str(), g_wifiPassword.c_str());
-    Serial.printf("WiFi: Verbindung zu '%s' im Hintergrund gestartet\n", g_wifiSsid.c_str());
+  // 2) WiFi starten (PHY-Init macht hier den Cache-Disable — noch KEIN Panel)
+  Serial.println("WiFi/BLE: starte VOR dem Display...");
+  if (g_featureWifi) {
+    WiFi.persistent(false);   // keine Flash-Schreibzugriffe durch WiFi
+    WiFi.setSleep(true);      // Modem-Sleep: weniger PSRAM-Bus-Konkurrenz
+    // NUR STA-Modus (kein softAP). Der AP-Dauerbeacon erzeugte staendige
+    // Funkaktivitaet, die den RGB-DMA aus dem Takt brachte -> Display schwarz.
+    // Web-GUI ist ueber die STA-IP erreichbar.
+    WiFi.mode(WIFI_STA);
+    if (g_wifiSsid.length() > 0) {
+      WiFi.begin(g_wifiSsid.c_str(), g_wifiPassword.c_str());
+      Serial.printf("WiFi: Verbindung zu '%s' gestartet\n", g_wifiSsid.c_str());
+      const uint32_t wifiWaitStart = millis();
+      while (WiFi.status() != WL_CONNECTED && millis() - wifiWaitStart < 8000) {
+        delay(100);
+      }
+      if (WiFi.status() == WL_CONNECTED) {
+        snprintf(g_ipStr, sizeof(g_ipStr), "%s", WiFi.localIP().toString().c_str());
+        Serial.printf("WiFi: verbunden vor Display, IP %s\n", g_ipStr);
+      } else {
+        Serial.println("WiFi: kein Connect vor Display -> WLAN AUS fuer stabilen Uhrstart");
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+        g_featureWifi = false;
+      }
+    }
+  } else {
+    WiFi.mode(WIFI_OFF);
+    Serial.println("WiFi: per Runtime-Schalter AUS");
   }
 
-  // BLE-Client fuer Spartan3-Hub (Motor-/Lambda-Daten). WiFi-Modem-Sleep
-  // bleibt aktiv (Default) fuer WiFi+BLE-Koexistenz auf dem ESP32-S3.
-  NimBLEDevice::init("VDO-Clock");
-  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
-  bleNextScanAt = millis() + 2000;  // kurz nach Boot ersten Scan starten
-  Serial.println("BLE: Client initialisiert");
+  // 3) BLE-Controller starten (auch das macht ggf. Cache-Disable)
+  if (g_featureBle) {
+    NimBLEDevice::init("VDO-Clock");
+    NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+    bleNextScanAt = millis() + 20000;
+    Serial.println("BLE: Client initialisiert");
+  } else {
+    bleNextScanAt = 0;
+    Serial.println("BLE: per Runtime-Schalter AUS");
+  }
+
+  // 4) JETZT erst das Display — danach keine Cache-Disable-Events mehr
+  Serial.println("Display: native ST7701 init (nach Radio)...");
+  nativeSt7701Init();
+  nativePanelInit();
+  pinMode(PIN_LCD_BL, OUTPUT);
+  applyBrightness();
+  drawVdoClock();
+  digitalWrite(PIN_LCD_BL, HIGH);
+  Serial.println("VDO clock drawn.");
+
+  // 5) Webserver (reine RAM-Operation, kein Flash)
+  if (g_featureWifi) {
+    startWebServer();
+  }
 }
 
 void loop() {
   static uint32_t lastTouch = 0;
   static uint32_t lastClockDraw = 0;
+  static String serialLine;
   uint16_t x = 0;
   uint16_t y = 0;
 
@@ -1795,13 +1947,27 @@ void loop() {
   }
 #endif
 
+  while (Serial.available() > 0) {
+    char c = static_cast<char>(Serial.read());
+    if (c == '\n' || c == '\r') {
+      if (serialLine.length() > 0) {
+        handleSerialCommand(serialLine);
+        serialLine = "";
+      }
+    } else if (serialLine.length() < 96) {
+      serialLine += c;
+    }
+  }
+
   // WiFi/NTP im Hintergrund (nicht-blockierend). Bei frischem Sync Uhr neu.
   if (wifiNtpTick() && currentPage == 0) {
     drawVdoClock();
   }
 
   // BLE-Client (Spartan-Hub) nicht-blockierend bedienen
-  bleTick();
+  if (g_featureBle) {
+    bleTick();
+  }
 
   // Web-GUI bedienen
   if (g_webStarted) {
