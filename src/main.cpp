@@ -638,19 +638,27 @@ static void drawMenuTile(int x, int y, int w, int h, const char *label, uint16_t
   drawTextSmall(x + 24, y + 22, label, RGB565(235, 235, 225), 4);
 }
 
+// Touch zones for menu: 5 equal 60px bands starting at y=108.
+// Zone 0 (UHR)=108..168, Zone 1 (MOTOR)=168..228, Zone 2 (LAMBDA)=228..288,
+// Zone 3 (HUB)=288..348, Zone 4 (SETUP)=348..408.
+// Tiles are drawn 2px inset so the visual tile exactly fills its touch zone.
+#define MENU_ZONE_Y0  108
+#define MENU_ZONE_H    60
+
 static void drawMenuOverview() {
   if (!ensureFrame()) return;
   fillFrame(RGB565_BLACK);
   drawCircleLine(240, 240, 216, 3, RGB565(80, 80, 75));
-  drawTextCentered(240, 54, "MENU", RGB565(235, 235, 225), 7);
-  drawMenuTile(88, 116, 304, 46, "UHR",    RGB565(200, 40,  35));
-  drawMenuTile(88, 172, 304, 46, "MOTOR",  RGB565(40,  150, 210));
-  drawMenuTile(88, 228, 304, 46, "LAMBDA", RGB565(60,  185, 90));
-  drawMenuTile(88, 284, 304, 46, "HUB",    RGB565(190, 90,  210));
-  drawMenuTile(88, 340, 304, 46, "SETUP",  RGB565(210, 170, 45));
+  drawTextCentered(240, 50, "MENU", RGB565(235, 235, 225), 7);
+  // Tiles inset 2px from zone boundary so visual == touchable area
+  drawMenuTile(88, MENU_ZONE_Y0 +   0 + 2, 304, MENU_ZONE_H - 4, "UHR",    RGB565(200, 40,  35));
+  drawMenuTile(88, MENU_ZONE_Y0 +  60 + 2, 304, MENU_ZONE_H - 4, "MOTOR",  RGB565(40,  150, 210));
+  drawMenuTile(88, MENU_ZONE_Y0 + 120 + 2, 304, MENU_ZONE_H - 4, "LAMBDA", RGB565(60,  185, 90));
+  drawMenuTile(88, MENU_ZONE_Y0 + 180 + 2, 304, MENU_ZONE_H - 4, "HUB",    RGB565(190, 90,  210));
+  drawMenuTile(88, MENU_ZONE_Y0 + 240 + 2, 304, MENU_ZONE_H - 4, "SETUP",  RGB565(210, 170, 45));
   char ipLine[32];
   snprintf(ipLine, sizeof(ipLine), "IP %s", g_ipStr);
-  drawTextCentered(240, 404, ipLine, RGB565(150, 200, 150), 2);
+  drawTextCentered(240, 420, ipLine, RGB565(150, 200, 150), 2);
   presentFrame();
 }
 
@@ -979,12 +987,14 @@ void loop() {
       drawMenuOverview();
       Serial.println("page: menu");
     } else if (currentPage == 1) {
-      // Route by y-position of the menu tiles (y origin 116, each tile h=46, gap=10)
-      if      (y >= 100 && y < 166) { currentPage = 0; drawVdoClock();   Serial.println("page: clock"); }
-      else if (y >= 166 && y < 222) { currentPage = 2; drawMotorPage();  Serial.println("page: motor"); }
-      else if (y >= 222 && y < 278) { currentPage = 3; drawLambdaPage(); Serial.println("page: lambda"); }
-      else if (y >= 278 && y < 334) { currentPage = 4; drawHubPage();    Serial.println("page: hub"); }
-      else if (y >= 334 && y < 405) { currentPage = 5; drawSetupPage();  Serial.println("page: setup"); }
+      // Route by y-position — zones match MENU_ZONE_Y0 / MENU_ZONE_H exactly
+      const uint16_t z0 = MENU_ZONE_Y0;
+      const uint16_t zh = MENU_ZONE_H;
+      if      (y >= z0       && y < z0 +   zh) { currentPage = 0; drawVdoClock();   Serial.println("page: clock"); }
+      else if (y >= z0 +  zh && y < z0 + 2*zh) { currentPage = 2; drawMotorPage();  Serial.println("page: motor"); }
+      else if (y >= z0 +2*zh && y < z0 + 3*zh) { currentPage = 3; drawLambdaPage(); Serial.println("page: lambda"); }
+      else if (y >= z0 +3*zh && y < z0 + 4*zh) { currentPage = 4; drawHubPage();    Serial.println("page: hub"); }
+      else if (y >= z0 +4*zh && y < z0 + 5*zh) { currentPage = 5; drawSetupPage();  Serial.println("page: setup"); }
       else { currentPage = 2; drawMotorPage(); Serial.println("page: motor fallback"); }
     } else {
       // Data pages: advance to next, wrap back to clock after SETUP
