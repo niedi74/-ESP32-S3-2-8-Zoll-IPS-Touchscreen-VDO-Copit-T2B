@@ -1,16 +1,6 @@
-// Waveshare ESP32-S3-Touch-LCD-2.8C — VDO Quartz-Zeit Clock
-// PHASE 1: Display Bring-up (Arduino_GFX, ST7701 RGB 480x480)
-//
-// Display: ST7701 RGB-Parallel. CS/RST des LCD + Touch-RST laufen ueber
-// einen PCA9554 I2C-Expander (@0x20). Arduino_GFX kann den Expander-CS
-// nicht selbst steuern -> wir halten CS dauerhaft LOW per Expander und
-// fuehren die Reset-Sequenz manuell aus, bevor gfx->begin() laeuft.
-//
-// HINWEIS: Die ST7701-Init-Sequenz ist board-spezifisch. Hier startet sie
-// mit st7701_type1_init_operations als Naeherung. Falls das Bild fehlt
-// oder Farben/Versatz falsch sind, brauchen wir die exakte Init aus dem
-// offiziellen Waveshare-2.8C-Demo (Arduino).
-
+// Waveshare ESP32-S3-Touch-LCD-2.8C - VDO Quartz-Zeit Clock
+// Main app: clock, touch, WiFi/NTP and WebGUI.
+// Display hardware ownership lives in hal_waveshare_28c.h.
 #include <Arduino.h>
 #include <Wire.h>
 #include <Preferences.h>
@@ -22,25 +12,13 @@
   #define WIFI_SSID     ""
   #define WIFI_PASSWORD ""
 #endif
-#include <Arduino_GFX_Library.h>
-#include "driver/spi_master.h"
-#include "esp_heap_caps.h"
-#include "esp_lcd_panel_ops.h"
-#include "esp_lcd_panel_rgb.h"
+#include "hal_waveshare_28c.h"
 #include "vdo_dial_480_rgb565.h"
 #include <sys/time.h>
 #include <time.h>
 
-// ---- I2C / PCA9554 Expander ----
-#define PIN_I2C_SDA   15
-#define PIN_I2C_SCL   7
+// ---- Touch / I2C Peripherie ----
 #define PIN_TOUCH_INT 16
-#define PCA9554_ADDR  0x20
-#define PCA9554_OUTPUT 0x01
-#define PCA9554_CONFIG 0x03
-#define EXIO_LCD_RST  (1 << 0)
-#define EXIO_TP_RST   (1 << 1)
-#define EXIO_LCD_CS   (1 << 2)
 
 #define GT911_ADDR_PRIMARY 0x5D
 #define GT911_ADDR_ALT     0x14
@@ -52,37 +30,13 @@
 #define PCF85063_CTRL1     0x00
 #define PCF85063_SECONDS   0x04   // sec, min, hour, day, wday, month, year (7 Byte)
 
-// ---- LCD ST7701 Init-SPI (3-wire; CS extern via Expander) ----
-#define PIN_LCD_SCK   2
-#define PIN_LCD_MOSI  1
-#define PIN_LCD_BL    6
+#ifndef RGB565
+#define RGB565(r, g, b) (uint16_t)((((uint16_t)(r) & 0xF8) << 8) | (((uint16_t)(g) & 0xFC) << 3) | ((uint16_t)(b) >> 3))
+#endif
+#ifndef RGB565_BLACK
+#define RGB565_BLACK RGB565(0, 0, 0)
+#endif
 
-// ---- RGB Sync ----
-#define PIN_DE     40
-#define PIN_VSYNC  39
-#define PIN_HSYNC  38
-#define PIN_PCLK   41
-
-// ---- RGB Daten (5R / 6G / 5B) ----
-#define PIN_R0 46
-#define PIN_R1 3
-#define PIN_R2 8
-#define PIN_R3 18
-#define PIN_R4 17
-#define PIN_G0 14
-#define PIN_G1 13
-#define PIN_G2 12
-#define PIN_G3 11
-#define PIN_G4 10
-#define PIN_G5 9
-#define PIN_B0 5
-#define PIN_B1 45
-#define PIN_B2 48
-#define PIN_B3 47
-#define PIN_B4 21
-
-// -------- PCA9554 Helfer --------
-static uint8_t pcaOutputState = EXIO_LCD_RST | EXIO_TP_RST | EXIO_LCD_CS;
 static uint8_t gt911Addr = GT911_ADDR_PRIMARY;
 static bool gt911Found = false;
 static uint8_t currentPage = 0;
@@ -247,80 +201,6 @@ static bool wifiNtpTick() {
   return false;
 }
 
-static uint8_t pca9554WriteOnce(uint8_t reg, uint8_t val) {
-  Wire.beginTransmission(PCA9554_ADDR);
-  Wire.write(reg);
-  Wire.write(val);
-  return Wire.endTransmission();
-}
-
-// Cold-Boot-Robust: bis zu 5 Versuche mit Delay. Der PCA9554 reagiert
-// direkt nach Power-On manchmal nicht auf den ersten I2C-Burst (I2C-Bus
-// noch nicht stabil). Bei Replug per USB war genau das der Grund warum
-// das Display schwarz blieb: erster expander-write erreichte den Chip
-// nicht, CS blieb HIGH, ST7701-Init ging ins Leere.
-static void pca9554Write(uint8_t reg, uint8_t val) {
-  if (reg == PCA9554_OUTPUT) {
-    pcaOutputState = val;
-  }
-  uint8_t err = 0xFF;
-  for (uint8_t attempt = 0; attempt < 5; attempt++) {
-    err = pca9554WriteOnce(reg, val);
-    if (err == 0) {
-      if (attempt > 0) {
-        Serial.printf("PCA9554 write reg 0x%02X = 0x%02X -> OK (try %u)\n",
-                      reg, val, attempt + 1);
-      } else {
-        Serial.printf("PCA9554 write reg 0x%02X = 0x%02X -> 0\n", reg, val);
-      }
-      return;
-    }
-    delay(10);
-  }
-  Serial.printf("PCA9554 write reg 0x%02X = 0x%02X -> FAIL (last err %u)\n",
-                reg, val, err);
-}
-
-static void pcaSetOutputBits(uint8_t mask, bool high) {
-  uint8_t next = high ? (pcaOutputState | mask) : (pcaOutputState & ~mask);
-  pca9554Write(PCA9554_OUTPUT, next);
-}
-
-static void scanI2C() {
-  Serial.println("I2C scan:");
-  for (uint8_t addr = 1; addr < 127; addr++) {
-    Wire.beginTransmission(addr);
-    if (Wire.endTransmission() == 0) {
-      Serial.printf("  found 0x%02X\n", addr);
-    }
-  }
-}
-
-// Expander init: Pin0..2 Output, HARTER Reset-Puls Display+Touch.
-// Bei USB-Replug bleiben die Caps geladen → ST7701 behaelt korrupten
-// internen Zustand. Loesung: RST-Pin SEHR lang LOW halten damit der
-// interne State-Machine-Reset sicher greift, dann lange Settle-Zeit.
-static void expanderInit() {
-  pca9554Write(PCA9554_CONFIG, 0xF8);   // Pin0..2 = Output
-
-  // 1) Alles HIGH (Ausgangs-Zustand)
-  pca9554Write(PCA9554_OUTPUT, EXIO_LCD_RST | EXIO_TP_RST | EXIO_LCD_CS);
-  delay(50);
-
-  // 2) RST LOW — wie in der funktionierenden Referenz (Boatingwiththebaileys):
-  //    kurzer Puls 10ms low, 50ms high reicht.
-  pca9554Write(PCA9554_OUTPUT, EXIO_LCD_CS);  // RST LOW, CS HIGH
-  delay(10);
-
-  // 3) RST HIGH — 50ms Settle
-  pca9554Write(PCA9554_OUTPUT, EXIO_LCD_RST | EXIO_TP_RST | EXIO_LCD_CS);
-  delay(50);
-
-  // 4) CS LOW fuer SPI-Init
-  pca9554Write(PCA9554_OUTPUT, EXIO_LCD_RST | EXIO_TP_RST);
-  delay(10);
-}
-
 static bool i2cRegRead16(uint8_t addr, uint16_t reg, uint8_t *data, uint8_t len) {
   Wire.beginTransmission(addr);
   Wire.write(reg >> 8);
@@ -354,14 +234,11 @@ static bool i2cRegWrite16(uint8_t addr, uint16_t reg, const uint8_t *data, uint8
 static void gt911ResetAddressMode(bool intHigh) {
   pinMode(PIN_TOUCH_INT, OUTPUT);
   digitalWrite(PIN_TOUCH_INT, intHigh ? HIGH : LOW);
-  pcaSetOutputBits(EXIO_TP_RST, false);
-  delay(10);
-  pcaSetOutputBits(EXIO_TP_RST, true);
-  delay(200);
+  delay(20);
   digitalWrite(PIN_TOUCH_INT, intHigh ? HIGH : LOW);
   delay(5);
   pinMode(PIN_TOUCH_INT, INPUT);
-  delay(50);
+  delay(80);
 }
 
 static bool gt911Probe() {
@@ -434,216 +311,20 @@ static bool readTouch(uint16_t *x, uint16_t *y) {
   return true;
 }
 
-// ST7701 Init-Sequenz: nur noch in nativeSt7701Init() (native SPI).
-
-// HINWEIS: Arduino_GFX globale Objekte (bus/rgbpanel/gfx) wurden entfernt.
-// Sie liefen ihre Konstruktoren VOR setup() und konfigurierten GPIO-Pins
-// (SPI + RGB), was mit dem nativen ESP-IDF Init kollidierte.
-// Das war die Ursache fuer "Display schwarz nach Replug".
-
-static spi_device_handle_t nativeSpi = nullptr;
-static esp_lcd_panel_handle_t nativePanel = nullptr;
-static uint16_t *nativeFrame = nullptr;
-
-static void nativeWriteCommand(uint8_t cmd) {
-  if (!nativeSpi) return;
-  spi_transaction_t t = {};
-  t.cmd = 0;
-  t.addr = cmd;
-  spi_device_transmit(nativeSpi, &t);
-}
-
-static void nativeWriteData(uint8_t data) {
-  if (!nativeSpi) return;
-  spi_transaction_t t = {};
-  t.cmd = 1;
-  t.addr = data;
-  spi_device_transmit(nativeSpi, &t);
-}
-
-static void nativeSt7701Init() {
-  // Bei Warm-Reset (USB replug -> rst:0x15) kann der SPI-Bus noch vom
-  // vorherigen Lauf belegt sein. Erst freigeben, dann neu init.
-  if (nativeSpi) {
-    spi_bus_remove_device(nativeSpi);
-    nativeSpi = nullptr;
-  }
-  spi_bus_free(SPI2_HOST);  // ignore error if not initialized
-
-  spi_bus_config_t buscfg = {};
-  buscfg.mosi_io_num = PIN_LCD_MOSI;
-  buscfg.miso_io_num = -1;
-  buscfg.sclk_io_num = PIN_LCD_SCK;
-  buscfg.quadwp_io_num = -1;
-  buscfg.quadhd_io_num = -1;
-  buscfg.max_transfer_sz = 64;
-  esp_err_t err = spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO);
-  Serial.printf("SPI bus init: %s\n", esp_err_to_name(err));
-
-  spi_device_interface_config_t devcfg = {};
-  devcfg.command_bits = 1;
-  devcfg.address_bits = 8;
-  devcfg.mode = SPI_MODE0;
-  devcfg.clock_speed_hz = 40000000;
-  devcfg.spics_io_num = -1;
-  devcfg.queue_size = 1;
-  err = spi_bus_add_device(SPI2_HOST, &devcfg, &nativeSpi);
-  Serial.printf("SPI device add: %s\n", esp_err_to_name(err));
-
-  pca9554Write(PCA9554_OUTPUT, EXIO_LCD_RST | EXIO_TP_RST); // CS low
-  delay(10);
-
-  // WICHTIG: KEIN SWRESET, KEIN frueher Sleep-Out!
-  // Die funktionierende Referenz (Boatingwiththebaileys / Waveshare BSP)
-  // startet direkt mit der Page-13-Sequenz. Ein SWRESET hier laesst das
-  // Panel in einem Zustand zurueck wo die Init nicht greift -> Display
-  // wird rosa/rot statt das Bild zu zeigen.
-  nativeWriteCommand(0xFF); nativeWriteData(0x77); nativeWriteData(0x01); nativeWriteData(0x00); nativeWriteData(0x00); nativeWriteData(0x13);
-  nativeWriteCommand(0xEF); nativeWriteData(0x08);
-  nativeWriteCommand(0xFF); nativeWriteData(0x77); nativeWriteData(0x01); nativeWriteData(0x00); nativeWriteData(0x00); nativeWriteData(0x10);
-  nativeWriteCommand(0xC0); nativeWriteData(0x3B); nativeWriteData(0x00);
-  nativeWriteCommand(0xC1); nativeWriteData(0x10); nativeWriteData(0x0C);
-  nativeWriteCommand(0xC2); nativeWriteData(0x07); nativeWriteData(0x0A);
-  nativeWriteCommand(0xC7); nativeWriteData(0x00);
-  nativeWriteCommand(0xCC); nativeWriteData(0x10);
-  nativeWriteCommand(0xCD); nativeWriteData(0x08);
-  nativeWriteCommand(0xB0);
-  for (uint8_t v : {0x05,0x12,0x98,0x0E,0x0F,0x07,0x07,0x09,0x09,0x23,0x05,0x52,0x0F,0x67,0x2C,0x11}) nativeWriteData(v);
-  nativeWriteCommand(0xB1);
-  for (uint8_t v : {0x0B,0x11,0x97,0x0C,0x12,0x06,0x06,0x08,0x08,0x22,0x03,0x51,0x11,0x66,0x2B,0x0F}) nativeWriteData(v);
-  nativeWriteCommand(0xFF); nativeWriteData(0x77); nativeWriteData(0x01); nativeWriteData(0x00); nativeWriteData(0x00); nativeWriteData(0x11);
-  nativeWriteCommand(0xB0); nativeWriteData(0x5D);
-  nativeWriteCommand(0xB1); nativeWriteData(0x3E);
-  nativeWriteCommand(0xB2); nativeWriteData(0x81);
-  nativeWriteCommand(0xB3); nativeWriteData(0x80);
-  nativeWriteCommand(0xB5); nativeWriteData(0x4E);
-  nativeWriteCommand(0xB7); nativeWriteData(0x85);
-  nativeWriteCommand(0xB8); nativeWriteData(0x20);
-  nativeWriteCommand(0xC1); nativeWriteData(0x78);
-  nativeWriteCommand(0xC2); nativeWriteData(0x78);
-  nativeWriteCommand(0xD0); nativeWriteData(0x88);
-  nativeWriteCommand(0xE0); nativeWriteData(0x00); nativeWriteData(0x00); nativeWriteData(0x02);
-  nativeWriteCommand(0xE1);
-  for (uint8_t v : {0x06,0x30,0x08,0x30,0x05,0x30,0x07,0x30,0x00,0x33,0x33}) nativeWriteData(v);
-  nativeWriteCommand(0xE2);
-  for (uint8_t v : {0x11,0x11,0x33,0x33,0xF4,0x00,0x00,0x00,0xF4,0x00,0x00,0x00}) nativeWriteData(v);
-  nativeWriteCommand(0xE3); nativeWriteData(0x00); nativeWriteData(0x00); nativeWriteData(0x11); nativeWriteData(0x11);
-  nativeWriteCommand(0xE4); nativeWriteData(0x44); nativeWriteData(0x44);
-  nativeWriteCommand(0xE5);
-  for (uint8_t v : {0x0D,0xF5,0x30,0xF0,0x0F,0xF7,0x30,0xF0,0x09,0xF1,0x30,0xF0,0x0B,0xF3,0x30,0xF0}) nativeWriteData(v);
-  nativeWriteCommand(0xE6); nativeWriteData(0x00); nativeWriteData(0x00); nativeWriteData(0x11); nativeWriteData(0x11);
-  nativeWriteCommand(0xE7); nativeWriteData(0x44); nativeWriteData(0x44);
-  nativeWriteCommand(0xE8);
-  for (uint8_t v : {0x0C,0xF4,0x30,0xF0,0x0E,0xF6,0x30,0xF0,0x08,0xF0,0x30,0xF0,0x0A,0xF2,0x30,0xF0}) nativeWriteData(v);
-  nativeWriteCommand(0xE9); nativeWriteData(0x36); nativeWriteData(0x01);
-  nativeWriteCommand(0xEB); nativeWriteData(0x00); nativeWriteData(0x01); nativeWriteData(0xE4); nativeWriteData(0xE4); nativeWriteData(0x44); nativeWriteData(0x88); nativeWriteData(0x40);
-  nativeWriteCommand(0xED);
-  for (uint8_t v : {0xFF,0x10,0xAF,0x76,0x54,0x2B,0xCF,0xFF,0xFF,0xFC,0xB2,0x45,0x67,0xFA,0x01,0xFF}) nativeWriteData(v);
-  nativeWriteCommand(0xEF); nativeWriteData(0x08); nativeWriteData(0x08); nativeWriteData(0x08); nativeWriteData(0x45); nativeWriteData(0x3F); nativeWriteData(0x54);
-  nativeWriteCommand(0xFF); nativeWriteData(0x77); nativeWriteData(0x01); nativeWriteData(0x00); nativeWriteData(0x00); nativeWriteData(0x00);
-  nativeWriteCommand(0x11);
-  delay(120);
-  nativeWriteCommand(0x3A); nativeWriteData(0x66);
-  nativeWriteCommand(0x36); nativeWriteData(0x00);
-  nativeWriteCommand(0x35); nativeWriteData(0x00);
-  nativeWriteCommand(0x29);
-  pca9554Write(PCA9554_OUTPUT, EXIO_LCD_RST | EXIO_TP_RST | EXIO_LCD_CS); // CS high
-  delay(10);
-}
-
-static void nativePanelInit() {
-  // Warm-Reset: altes Panel zerstoeren falls vorhanden
-  if (nativePanel) {
-    esp_lcd_panel_del(nativePanel);
-    nativePanel = nullptr;
-  }
-  // Frame-Buffer freigeben (wird in ensureFrame() neu alloziert)
-  if (nativeFrame) {
-    heap_caps_free(nativeFrame);
-    nativeFrame = nullptr;
-  }
-
-  esp_lcd_rgb_panel_config_t cfg = {};
-  cfg.clk_src = LCD_CLK_SRC_PLL160M;
-  cfg.timings.pclk_hz = 8000000;
-  cfg.timings.h_res = 480;
-  cfg.timings.v_res = 480;
-  cfg.timings.hsync_pulse_width = 8;
-  cfg.timings.hsync_back_porch = 10;
-  cfg.timings.hsync_front_porch = 50;
-  cfg.timings.vsync_pulse_width = 2;
-  cfg.timings.vsync_back_porch = 18;
-  cfg.timings.vsync_front_porch = 8;
-  cfg.timings.flags.pclk_active_neg = 0;
-  cfg.data_width = 16;
-  cfg.bits_per_pixel = 16;
-  cfg.num_fbs = 1;   // single fb wie funktionierende Referenz
-  cfg.bounce_buffer_size_px = 0;
-  cfg.psram_trans_align = 64;
-  cfg.hsync_gpio_num = PIN_HSYNC;
-  cfg.vsync_gpio_num = PIN_VSYNC;
-  cfg.de_gpio_num = PIN_DE;
-  cfg.pclk_gpio_num = PIN_PCLK;
-  cfg.disp_gpio_num = GPIO_NUM_NC;
-  cfg.data_gpio_nums[0] = PIN_B0;
-  cfg.data_gpio_nums[1] = PIN_B1;
-  cfg.data_gpio_nums[2] = PIN_B2;
-  cfg.data_gpio_nums[3] = PIN_B3;
-  cfg.data_gpio_nums[4] = PIN_B4;
-  cfg.data_gpio_nums[5] = PIN_G0;
-  cfg.data_gpio_nums[6] = PIN_G1;
-  cfg.data_gpio_nums[7] = PIN_G2;
-  cfg.data_gpio_nums[8] = PIN_G3;
-  cfg.data_gpio_nums[9] = PIN_G4;
-  cfg.data_gpio_nums[10] = PIN_G5;
-  cfg.data_gpio_nums[11] = PIN_R0;
-  cfg.data_gpio_nums[12] = PIN_R1;
-  cfg.data_gpio_nums[13] = PIN_R2;
-  cfg.data_gpio_nums[14] = PIN_R3;
-  cfg.data_gpio_nums[15] = PIN_R4;
-  cfg.flags.fb_in_psram = true;
-
-  esp_err_t err = esp_lcd_new_rgb_panel(&cfg, &nativePanel);
-  Serial.printf("RGB panel create: %s\n", esp_err_to_name(err));
-  if (err != ESP_OK) return;
-  err = esp_lcd_panel_reset(nativePanel);
-  Serial.printf("RGB panel reset: %s\n", esp_err_to_name(err));
-  err = esp_lcd_panel_init(nativePanel);
-  Serial.printf("RGB panel init: %s\n", esp_err_to_name(err));
-}
-
-static void nativeFill(uint16_t color) {
-  if (!nativeFrame) {
-    nativeFrame = (uint16_t *)heap_caps_malloc(480 * 480 * sizeof(uint16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    Serial.printf("nativeFrame: %p\n", nativeFrame);
-  }
-  if (!nativeFrame) {
-    return;
-  }
-  for (int i = 0; i < 480 * 480; i++) {
-    nativeFrame[i] = color;
-  }
-  if (nativePanel) esp_lcd_panel_draw_bitmap(nativePanel, 0, 0, 480, 480, nativeFrame);
-}
-
+// Display framebuffer access: all hardware init and RGB panel ownership lives in HAL.
 static bool ensureFrame() {
-  if (!nativeFrame) {
-    nativeFrame = (uint16_t *)heap_caps_malloc(480 * 480 * sizeof(uint16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    Serial.printf("nativeFrame: %p\n", nativeFrame);
-  }
-  return nativeFrame != nullptr;
+  return hal_fb() != nullptr;
 }
 
 static void presentFrame() {
-  if (nativeFrame && nativePanel) {
-    esp_lcd_panel_draw_bitmap(nativePanel, 0, 0, 480, 480, nativeFrame);
-  }
+  hal_present();
 }
 
 // Zifferblatt in den Frame kopieren, skaliert auf g_dialScalePct % und
 // zentriert auf schwarzem Grund (Nearest-Neighbor). Bei 100% = 1:1.
 static void copyVdoDialToFrame() {
-  if (!ensureFrame()) {
+  uint16_t *fb = hal_fb();
+  if (!fb) {
     return;
   }
   int pct = g_dialScalePct;
@@ -652,13 +333,13 @@ static void copyVdoDialToFrame() {
 
   if (pct == 100) {
     for (int i = 0; i < 480 * 480; i++) {
-      nativeFrame[i] = pgm_read_word(&VDO_DIAL_480_RGB565[i]);
+      fb[i] = pgm_read_word(&VDO_DIAL_480_RGB565[i]);
     }
     return;
   }
 
   // Hintergrund schwarz, dann skaliertes Zifferblatt zentriert einsetzen.
-  for (int i = 0; i < 480 * 480; i++) nativeFrame[i] = RGB565_BLACK;
+  for (int i = 0; i < 480 * 480; i++) fb[i] = RGB565_BLACK;
   int outSize = (480 * pct) / 100;
   int offset = (480 - outSize) / 2;
   for (int oy = 0; oy < outSize; oy++) {
@@ -667,26 +348,21 @@ static void copyVdoDialToFrame() {
     int srcRow = sy * 480;
     for (int ox = 0; ox < outSize; ox++) {
       int sx = (ox * 480) / outSize;
-      nativeFrame[dstRow + ox] = pgm_read_word(&VDO_DIAL_480_RGB565[srcRow + sx]);
+      fb[dstRow + ox] = pgm_read_word(&VDO_DIAL_480_RGB565[srcRow + sx]);
     }
   }
 }
 
 static void setPixel(int x, int y, uint16_t color) {
-  if ((unsigned)x < 480 && (unsigned)y < 480) {
-    nativeFrame[y * 480 + x] = color;
+  uint16_t *fb = hal_fb();
+  if (fb && (unsigned)x < 480 && (unsigned)y < 480) {
+    fb[y * 480 + x] = color;
   }
 }
 
 static void fillFrame(uint16_t color) {
-  if (!ensureFrame()) {
-    return;
-  }
-  for (int i = 0; i < 480 * 480; i++) {
-    nativeFrame[i] = color;
-  }
+  hal_fill(color);
 }
-
 static void fillRectFast(int x, int y, int w, int h, uint16_t color) {
   for (int yy = y; yy < y + h; yy++) {
     for (int xx = x; xx < x + w; xx++) {
@@ -1030,11 +706,8 @@ static void startWebServer() {
 }
 
 void setup() {
-  // Cold-Boot Robustness: erst 250ms warten damit die Versorgung sauber
-  // hochlaeuft, bevor wir I2C/Display anpacken. Bei direktem USB-Plug-in
-  // war das Display sonst manchmal schwarz weil der PCA9554 noch nicht
-  // sicher antwortet und der erste expander-Write ins Leere ging.
-  delay(250);
+  // Cold-Boot Robustness: give USB power and the expander time to settle.
+  delay(500);
 
   Serial.begin(115200);
   // USB-CDC: Nicht auf Host warten. Wenn kein Serial-Monitor offen ist,
@@ -1045,48 +718,33 @@ void setup() {
 
   Serial.printf("PSRAM found: %s, size: %u bytes\n", psramFound() ? "yes" : "no", ESP.getPsramSize());
 
-  // Backlight Diagnose-Blink: 2x 50ms ON-OFF, damit man sieht dass der
-  // Chip bootet und GPIO 6 schaltbar ist — selbst wenn der Panel-Init
-  // spaeter scheitert, sieht man wenigstens "die Hardware lebt".
-  pinMode(PIN_LCD_BL, OUTPUT);
-  digitalWrite(PIN_LCD_BL, HIGH);
+  // Backlight Diagnose-Blink: 2x 50ms ON-OFF, bevor das Panel initialisiert wird.
+  hal_backlight(true);
   delay(50);
-  digitalWrite(PIN_LCD_BL, LOW);
+  hal_backlight(false);
   delay(50);
-  digitalWrite(PIN_LCD_BL, HIGH);
+  hal_backlight(true);
   delay(50);
-  digitalWrite(PIN_LCD_BL, LOW);   // wieder aus, sonst sieht man Init-Muell
+  hal_backlight(false);
 
-  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL, 100000);
-  delay(20);  // I2C-Bus erstmal still lassen
-  scanI2C();
-  Serial.println("PCA9554: init + reset");
-  expanderInit();
-
-  Serial.println("Display: native ST7701 init...");
-  nativeSt7701Init();
-  nativePanelInit();
-  Serial.println("Display: native panel OK");
-
-  gt911Init();
   loadSettings();
-  initTimeSource();
 
-  // Backlight an
-  pinMode(PIN_LCD_BL, OUTPUT);
-  digitalWrite(PIN_LCD_BL, HIGH);
-
-  drawVdoClock();
-  Serial.println("VDO clock drawn.");
-
-  // WiFi-Verbindung im Hintergrund starten (nicht-blockierend). NTP-Sync
-  // und IP-Anzeige passieren im loop() sobald die Verbindung steht, ohne
-  // den Boot oder die Uhr aufzuhalten. Retry laeuft automatisch weiter.
+  // WiFi startet vor dem RGB-Panel. So passieren eventuelle Cache-Disable-Phasen
+  // nicht mitten in der Panel-Initialisierung.
   if (strlen(WIFI_SSID) > 0) {
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     Serial.printf("WiFi: Verbindung zu '%s' im Hintergrund gestartet\n", WIFI_SSID);
   }
+
+  Serial.println("Display: HAL init...");
+  hal_init();
+  gt911Init();
+  initTimeSource();
+  hal_backlight(true);
+
+  drawVdoClock();
+  Serial.println("VDO clock drawn.");
 }
 
 void loop() {
