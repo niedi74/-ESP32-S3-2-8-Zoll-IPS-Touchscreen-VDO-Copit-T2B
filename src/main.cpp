@@ -34,7 +34,7 @@
 #include <sys/time.h>
 #include <time.h>
 
-#define COCKPIT_DISPLAY_ONLY 1
+#define COCKPIT_DISPLAY_ONLY 0
 #define FEATURE_TOUCH 0
 
 // ---- I2C / PCA9554 Expander ----
