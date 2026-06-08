@@ -34,7 +34,7 @@
 #include <sys/time.h>
 #include <time.h>
 
-#define COCKPIT_DISPLAY_ONLY 0
+#define COCKPIT_DISPLAY_ONLY 1
 #define FEATURE_TOUCH 0
 
 // ---- I2C / PCA9554 Expander ----
@@ -1737,6 +1737,18 @@ static void coldBootDisplayRetry() {
   Serial.println("Display: cold-boot retry drawn.");
 }
 
+static void displayKeepAlive() {
+  digitalWrite(PIN_LCD_BL, HIGH);
+  if (nativePanel) {
+    esp_lcd_rgb_panel_restart(nativePanel);
+  }
+  if (currentPage == 0) {
+    drawVdoClock();
+  } else {
+    drawCurrentPage();
+  }
+}
+
 static void displayRescueReinit(const char *reason, bool refreshSd) {
   Serial.printf("Display: rescue reinit (%s)...\n", reason ? reason : "auto");
   const bool sdWasReady = g_sdReady;
@@ -1889,6 +1901,7 @@ void setup() {
 void loop() {
   static uint32_t lastTouch = 0;
   static uint32_t lastClockDraw = 0;
+  static uint32_t lastDisplayKeepAlive = 0;
   static String serialLine;
   uint16_t x = 0;
   uint16_t y = 0;
@@ -1971,6 +1984,10 @@ void loop() {
   } else if (g_lateDisplayRescuesDone == 1 && millis() > 10000) {
     g_lateDisplayRescuesDone++;
     coldBootDisplayRetry();
+  }
+  if (millis() - lastDisplayKeepAlive >= 2000) {
+    lastDisplayKeepAlive = millis();
+    displayKeepAlive();
   }
 
   // WiFi/NTP im Hintergrund (nicht-blockierend). Bei frischem Sync Uhr neu.

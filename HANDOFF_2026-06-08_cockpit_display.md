@@ -19,16 +19,15 @@
 - Manuelles serielles `clock` brachte die Uhr wieder. Daher ist ein automatischer Cold-Boot-Retry eingebaut.
 
 ## Aktuelle Firmware-Strategie
-- Boot zeichnet Uhr sofort.
-- Backlight bleibt hart HIGH.
-- Automatische Display-Retries nach ca. 4s und 10s:
-  - `coldBootDisplayRetry()`
-  - expander init
-  - ST7701 init
-  - RGB panel init
-  - aktuelle Seite neu zeichnen
-- WLAN/Web und BLE sind Runtime-Schalter, aber Stabilitaet geht vor.
-- BLE default aus.
+- Stand nach weiterem Debugging: `COCKPIT_DISPLAY_ONLY 1`.
+- Nur-Uhr-Firmware wurde wieder geflasht, weil diese beim User bisher stabil war.
+- WLAN/Web/BLE/Touch/SD duerfen nicht mehr gleichzeitig mit dem Displayproblem getestet werden.
+- `platformio.ini` hat wieder die S3/RGB/PSRAM-Stabilitaetsflags:
+  - `BOARD_HAS_PSRAM`
+  - `CONFIG_ESP32S3_DATA_CACHE_LINE_64B=1`
+  - `CONFIG_SPIRAM_SPEED_120M=1`
+  - `CONFIG_LCD_RGB_RESTART_IN_VSYNC=1`
+  - `board_build.psram_type = opi`
 
 ## Serielle Befehle COM13 / 115200
 - `status`
@@ -45,8 +44,11 @@
 ## Wichtig fuer naechsten Schritt
 - Fokus eng halten:
   1. USB-C Power-Cycle: Uhr muss allein wiederkommen.
-  2. Erst danach Motorraum-Hub-Daten anzeigen.
-  3. Touch/Encoder nur fuer Seitenwechsel.
+  2. Dann Display-HAL aus Marine-Displays sauber portieren.
+  3. Erst danach Motorraum-Hub-Daten anzeigen.
+  4. Touch/Encoder nur fuer Seitenwechsel.
+- Aktueller Code enthaelt keinen M5GFX/M5Stack-Init, der RGB-Pins belegt.
+- Trotzdem ist die Marine-Displays-HAL der richtige naechste Umbau, damit Display-Init und App-Code getrennt sind.
 - WebGUI/WLAN nicht mehr mitten im laufenden Display neu starten.
 - Motorraum-Hub-Werte bevorzugt per BLE vom Hub empfangen; Hub-Funktionen einzeln zuschalten.
 
