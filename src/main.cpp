@@ -34,6 +34,8 @@
 #include <sys/time.h>
 #include <time.h>
 
+#define COCKPIT_DISPLAY_ONLY 1
+
 // ---- I2C / PCA9554 Expander ----
 #define PIN_I2C_SDA   15
 #define PIN_I2C_SCL   7
@@ -1463,7 +1465,8 @@ static void handleWebRoot() {
     "<a href='/page?p=2'><button>Motor</button></a>"
     "<a href='/page?p=3'><button>Lambda</button></a>"
     "<a href='/page?p=4'><button>Hub</button></a>"
-    "<a href='/page?p=5'><button>Setup</button></a></div>");
+    "<a href='/page?p=5'><button>Setup</button></a>"
+    "<a href='/display_reinit'><button>Display neu init</button></a></div>");
   html += F("<div class='card'><h3>Hub Live</h3>");
   html += "<div>BLE: " + String(g_bleConn ? "verbunden" : "scan") + "</div>";
   html += "<div>RX: " + String((unsigned long)g_bleRxCnt) + "</div>";
@@ -1680,7 +1683,9 @@ void setup() {
   nativePanelInit();
   Serial.println("Display: native panel OK");
 
+#if !COCKPIT_DISPLAY_ONLY
   gt911Init();
+#endif
   loadSettings();
   initTimeSource();
 
@@ -1690,8 +1695,12 @@ void setup() {
 
   drawVdoClock();
   Serial.println("VDO clock drawn.");
-  delay(700);
-  coldBootDisplayRetry();
+  digitalWrite(PIN_LCD_BL, HIGH);
+
+#if COCKPIT_DISPLAY_ONLY
+  Serial.println("Cockpit display-only mode: WiFi/BLE/SD/Touch disabled");
+  return;
+#endif
   // SD bleibt fuer den Cockpit-Feldtest aus. GPIO1/2 teilen sich LCD-Init und
   // SD_MMC; zuerst muss "USB-C an = Uhr bleibt sichtbar" stabil sein.
   Serial.println("SD: Autostart deaktiviert fuer Cockpit-Feldtest");
@@ -1720,6 +1729,16 @@ void loop() {
   static uint32_t lastClockDraw = 0;
   uint16_t x = 0;
   uint16_t y = 0;
+
+#if COCKPIT_DISPLAY_ONLY
+  digitalWrite(PIN_LCD_BL, HIGH);
+  if (millis() - lastClockDraw >= 1000) {
+    lastClockDraw = millis();
+    drawVdoClock();
+  }
+  delay(10);
+  return;
+#endif
 
   if (readTouch(&x, &y) && millis() - lastTouch > 350) {
     lastTouch = millis();
