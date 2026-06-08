@@ -1612,6 +1612,7 @@ static void handleWebSet() {
 }
 
 static void displayRescueReinit(const char *reason, bool refreshSd);
+static void coldBootDisplayRetry();
 
 static void handleWebDisplayReinit() {
   displayRescueReinit("web", true);
@@ -1715,20 +1716,24 @@ static void handleSerialCommand(const String &raw) {
     currentPage = 0;
     drawVdoClock();
     Serial.println("OK clock");
+  } else if (cmd == "reinit") {
+    coldBootDisplayRetry();
+    Serial.println("OK reinit");
   } else {
-    Serial.println("Commands: status | safe | wifi:zoo | wifi:s24 | wifi:on | wifi:off | ble:on | ble:off | clock");
+    Serial.println("Commands: status | safe | wifi:zoo | wifi:s24 | wifi:on | wifi:off | ble:on | ble:off | clock | reinit");
   }
 }
 
 static void coldBootDisplayRetry() {
   Serial.println("Display: cold-boot retry init...");
-  digitalWrite(PIN_LCD_BL, LOW);
-  delay(120);
+  digitalWrite(PIN_LCD_BL, HIGH);
+  delay(80);
   expanderInit();
   nativeSt7701Init();
   nativePanelInit();
   applyBrightness();
   drawCurrentPage();
+  digitalWrite(PIN_LCD_BL, HIGH);
   Serial.println("Display: cold-boot retry drawn.");
 }
 
@@ -1957,6 +1962,15 @@ void loop() {
     } else if (serialLine.length() < 96) {
       serialLine += c;
     }
+  }
+
+  digitalWrite(PIN_LCD_BL, HIGH);
+  if (g_lateDisplayRescuesDone == 0 && millis() > 4000) {
+    g_lateDisplayRescuesDone++;
+    coldBootDisplayRetry();
+  } else if (g_lateDisplayRescuesDone == 1 && millis() > 10000) {
+    g_lateDisplayRescuesDone++;
+    coldBootDisplayRetry();
   }
 
   // WiFi/NTP im Hintergrund (nicht-blockierend). Bei frischem Sync Uhr neu.
