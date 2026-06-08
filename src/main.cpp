@@ -1,7 +1,7 @@
 // Waveshare ESP32-S3-Touch-LCD-2.8C — VDO Quartz-Zeit Clock
 // PHASE 1: Display Bring-up (Arduino_GFX, ST7701 RGB 480x480)
 //
-// Display: ST7701 RGB-Parallel. CS/RST des LCD + Touch-RST laufen ueber
+// Display: ST7701 RGB-Parallel. CS/RST des LCD laufen ueber
 // einen PCA9554 I2C-Expander (@0x20). Arduino_GFX kann den Expander-CS
 // nicht selbst steuern -> wir halten CS dauerhaft LOW per Expander und
 // fuehren die Reset-Sequenz manuell aus, bevor gfx->begin() laeuft.
@@ -35,6 +35,7 @@
 #include <time.h>
 
 #define COCKPIT_DISPLAY_ONLY 1
+#define FEATURE_TOUCH 0
 
 // ---- I2C / PCA9554 Expander ----
 #define PIN_I2C_SDA   15
@@ -1275,7 +1276,8 @@ static void drawSetupPage() {
   drawDataRow(152, "HELL", buf, RGB565(235, 235, 225));
   snprintf(buf, sizeof(buf), "%d DEG", g_rotationDeg);
   drawDataRow(192, "ROT", buf, RGB565(235, 235, 225));
-  drawDataRow(232, "TOUCH", touchSeen ? "AKTIV" : "WARTET", touchSeen ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
+  drawDataRow(232, "TOUCH", FEATURE_TOUCH ? (touchSeen ? "AKTIV" : "WARTET") : "AUS",
+              FEATURE_TOUCH && touchSeen ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
   drawDataRow(272, "WIFI", WiFi.status() == WL_CONNECTED ? "OK" : "---", WiFi.status() == WL_CONNECTED ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
   drawDataRow(312, "SD", g_sdReady ? g_sdType.c_str() : "---", g_sdReady ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
 
@@ -1474,10 +1476,14 @@ static void handleWebRoot() {
   html += "<div>RPM: " + String((int)g_rpm) + " &nbsp; ADV: " + String(g_adv, 1) + "</div>";
   html += "<div>Batt: " + String(g_battValid ? String(g_battVolt, 1) + " V" : String("---")) + "</div></div>";
   html += F("<div class='card'><h3>Touch</h3>");
+#if FEATURE_TOUCH
   html += "<div>Chip: " + String(gt911Found ? "GT911 OK" : "nicht gefunden") + " @0x" + String(gt911Addr, HEX) + "</div>";
   html += "<div>Status: 0x" + String(g_lastTouchStatus, HEX) + "</div>";
   html += "<div>Letzter Punkt: X " + String(g_lastTouchX) + " / Y " + String(g_lastTouchY) + "</div>";
   html += "<div>Alter: " + String(g_lastTouchMs ? (millis() - g_lastTouchMs) : 0) + " ms</div></div>";
+#else
+  html += F("<div>Nicht verbaut / deaktiviert</div></div>");
+#endif
   html += F("<div class='card'><h3>microSD</h3>");
   html += "<div>Status: " + String(g_sdReady ? "bereit" : "nicht bereit") + "</div>";
   html += "<div>Typ: " + g_sdType + "</div>";
@@ -1683,7 +1689,7 @@ void setup() {
   nativePanelInit();
   Serial.println("Display: native panel OK");
 
-#if !COCKPIT_DISPLAY_ONLY
+#if !COCKPIT_DISPLAY_ONLY && FEATURE_TOUCH
   gt911Init();
 #endif
   loadSettings();
@@ -1740,6 +1746,7 @@ void loop() {
   return;
 #endif
 
+#if FEATURE_TOUCH
   if (readTouch(&x, &y) && millis() - lastTouch > 350) {
     lastTouch = millis();
     touchSeen = true;
@@ -1786,6 +1793,7 @@ void loop() {
       Serial.printf("page: next %u\n", currentPage);
     }
   }
+#endif
 
   // WiFi/NTP im Hintergrund (nicht-blockierend). Bei frischem Sync Uhr neu.
   if (wifiNtpTick() && currentPage == 0) {
