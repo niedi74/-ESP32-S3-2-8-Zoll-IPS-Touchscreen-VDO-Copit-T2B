@@ -40,14 +40,7 @@ The 3D model is useful for:
 - Verifying connector clearances before printing or ordering a case
 - Integration into a PCB assembly drawing in KiCad or Altium
 
-## Notes on large binary files
+## File
 
-STEP files can exceed GitHub's 50 MB soft limit. If the file is large,
-consider tracking it with **Git LFS**:
-
-```bash
-git lfs track "*.step" "*.stp" "*.STEP" "*.STP"
-git add .gitattributes
-git add docs/3d-model/ESP32-S3-Touch-LCD-2.8C.step
-git commit -m "Add Waveshare ESP32-S3-Touch-LCD-2.8C STEP model"
-```
+`ESP32-S3-Touch-LCD-2.8C-20241226.step` — 17.8 MB, ISO 10303-21 (STEP AP214)
+Released by Waveshare on 2024-12-26.

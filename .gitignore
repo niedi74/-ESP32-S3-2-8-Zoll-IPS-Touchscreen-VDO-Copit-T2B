@@ -14,9 +14,3 @@ dependencies.lock
 managed_components/
 sdkconfig*
 
-# 3D model binaries — track with Git LFS or keep local only
-# Remove these lines once Git LFS is configured for this repo
-*.step
-*.stp
-*.STEP
-*.STP
