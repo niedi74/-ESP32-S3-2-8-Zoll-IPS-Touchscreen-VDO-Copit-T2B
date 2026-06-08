@@ -17,6 +17,8 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <NimBLEDevice.h>
+#include <FS.h>
+#include <SD_MMC.h>
 #if __has_include("wifi_secret.h")
   #include "wifi_secret.h"
 #else
@@ -42,6 +44,7 @@
 #define EXIO_LCD_RST  (1 << 0)
 #define EXIO_TP_RST   (1 << 1)
 #define EXIO_LCD_CS   (1 << 2)
+#define EXIO_SD_D3    (1 << 3)
 
 #define GT911_ADDR_PRIMARY 0x5D
 #define GT911_ADDR_ALT     0x14
@@ -57,6 +60,9 @@
 #define PIN_LCD_SCK   2
 #define PIN_LCD_MOSI  1
 #define PIN_LCD_BL    6
+#define PIN_SD_CLK    2
+#define PIN_SD_CMD    1
+#define PIN_SD_D0     42
 
 // ---- RGB Sync ----
 #define PIN_DE     40
@@ -83,7 +89,7 @@
 #define PIN_B4 21
 
 // -------- PCA9554 Helfer --------
-static uint8_t pcaOutputState = EXIO_LCD_RST | EXIO_TP_RST | EXIO_LCD_CS;
+static uint8_t pcaOutputState = EXIO_LCD_RST | EXIO_TP_RST | EXIO_LCD_CS | EXIO_SD_D3;
 static uint8_t gt911Addr = GT911_ADDR_PRIMARY;
 static bool gt911Found = false;
 static uint8_t currentPage = 0;
@@ -100,6 +106,10 @@ static String g_wifiSsid = "";
 static String g_wifiPassword = "";
 static bool g_wifiSaved = false;
 static bool g_webStarted = false;
+static bool g_sdReady = false;
+static String g_sdType = "none";
+static uint64_t g_sdTotalBytes = 0;
+static uint64_t g_sdUsedBytes = 0;
 static bool g_redrawClock = false; // Flag: Uhr neu zeichnen (z.B. nach Web-Aenderung)
 static bool g_redrawPage = false;  // Flag: aktuelle Display-Seite neu zeichnen
 static WebServer webServer(80);
@@ -453,24 +463,24 @@ static void scanI2C() {
 // internen Zustand. Loesung: RST-Pin SEHR lang LOW halten damit der
 // interne State-Machine-Reset sicher greift, dann lange Settle-Zeit.
 static void expanderInit() {
-  pca9554Write(PCA9554_CONFIG, 0xF8);   // Pin0..2 = Output
+  pca9554Write(PCA9554_CONFIG, 0xF0);   // Pin0..3 = Output
 
   // 1) Alles HIGH (Ausgangs-Zustand)
-  pca9554Write(PCA9554_OUTPUT, EXIO_LCD_RST | EXIO_TP_RST | EXIO_LCD_CS);
-  delay(50);
+  pca9554Write(PCA9554_OUTPUT, EXIO_LCD_RST | EXIO_TP_RST | EXIO_LCD_CS | EXIO_SD_D3);
+  delay(120);
 
   // 2) RST LOW — wie in der funktionierenden Referenz (Boatingwiththebaileys):
   //    kurzer Puls 10ms low, 50ms high reicht.
-  pca9554Write(PCA9554_OUTPUT, EXIO_LCD_CS);  // RST LOW, CS HIGH
-  delay(10);
+  pca9554Write(PCA9554_OUTPUT, EXIO_LCD_CS | EXIO_SD_D3);  // RST LOW, CS HIGH
+  delay(180);
 
   // 3) RST HIGH — 50ms Settle
-  pca9554Write(PCA9554_OUTPUT, EXIO_LCD_RST | EXIO_TP_RST | EXIO_LCD_CS);
-  delay(50);
+  pca9554Write(PCA9554_OUTPUT, EXIO_LCD_RST | EXIO_TP_RST | EXIO_LCD_CS | EXIO_SD_D3);
+  delay(220);
 
   // 4) CS LOW fuer SPI-Init
-  pca9554Write(PCA9554_OUTPUT, EXIO_LCD_RST | EXIO_TP_RST);
-  delay(10);
+  pca9554Write(PCA9554_OUTPUT, EXIO_LCD_RST | EXIO_TP_RST | EXIO_SD_D3);
+  delay(40);
 }
 
 static bool i2cRegRead16(uint8_t addr, uint16_t reg, uint8_t *data, uint8_t len) {
@@ -647,7 +657,7 @@ static void nativeSt7701Init() {
   err = spi_bus_add_device(SPI2_HOST, &devcfg, &nativeSpi);
   Serial.printf("SPI device add: %s\n", esp_err_to_name(err));
 
-  pca9554Write(PCA9554_OUTPUT, EXIO_LCD_RST | EXIO_TP_RST); // CS low
+  pca9554Write(PCA9554_OUTPUT, EXIO_LCD_RST | EXIO_TP_RST | EXIO_SD_D3); // CS low
   delay(10);
 
   // WICHTIG: KEIN SWRESET, KEIN frueher Sleep-Out!
@@ -704,7 +714,7 @@ static void nativeSt7701Init() {
   nativeWriteCommand(0x36); nativeWriteData(0x00);
   nativeWriteCommand(0x35); nativeWriteData(0x00);
   nativeWriteCommand(0x29);
-  pca9554Write(PCA9554_OUTPUT, EXIO_LCD_RST | EXIO_TP_RST | EXIO_LCD_CS); // CS high
+  pca9554Write(PCA9554_OUTPUT, EXIO_LCD_RST | EXIO_TP_RST | EXIO_LCD_CS | EXIO_SD_D3); // CS high
   delay(10);
 }
 
@@ -1258,7 +1268,7 @@ static void drawSetupPage() {
   drawDataRow(192, "ROT", buf, RGB565(235, 235, 225));
   drawDataRow(232, "TOUCH", touchSeen ? "AKTIV" : "WARTET", touchSeen ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
   drawDataRow(272, "WIFI", WiFi.status() == WL_CONNECTED ? "OK" : "---", WiFi.status() == WL_CONNECTED ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
-  drawDataRow(312, "BLE", g_bleConn ? "HUB OK" : "SCAN", g_bleConn ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
+  drawDataRow(312, "SD", g_sdReady ? g_sdType.c_str() : "---", g_sdReady ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
 
   drawTextCentered(240, 370, "TIP MENU", RGB565(180, 180, 170), 2);
   presentFrame();
@@ -1359,6 +1369,70 @@ static void saveWifi(const String &ssid, const String &password) {
   }
 }
 
+static String formatStorageMb(uint64_t bytes) {
+  return String((unsigned long)(bytes / (1024ULL * 1024ULL))) + " MB";
+}
+
+static void initSdCard() {
+  g_sdReady = false;
+  g_sdType = "none";
+  g_sdTotalBytes = 0;
+  g_sdUsedBytes = 0;
+
+  Serial.println("SD: init 1-bit SD_MMC...");
+  pcaSetOutputBits(EXIO_SD_D3, true);
+  delay(10);
+
+  if (!SD_MMC.setPins(PIN_SD_CLK, PIN_SD_CMD, PIN_SD_D0, -1, -1, -1)) {
+    Serial.println("SD: setPins fehlgeschlagen");
+    return;
+  }
+
+  bool mounted = SD_MMC.begin("/sdcard", true, false, 40000);
+  if (!mounted) {
+    Serial.println("SD: 40 MHz fehlgeschlagen, retry 20 MHz");
+    SD_MMC.end();
+    delay(50);
+    mounted = SD_MMC.begin("/sdcard", true, false, 20000);
+  }
+  if (!mounted) {
+    Serial.println("SD: mount fehlgeschlagen");
+    return;
+  }
+
+  uint8_t cardType = SD_MMC.cardType();
+  if (cardType == CARD_NONE) {
+    Serial.println("SD: keine Karte erkannt");
+    SD_MMC.end();
+    return;
+  }
+
+  if (cardType == CARD_MMC) g_sdType = "MMC";
+  else if (cardType == CARD_SD) g_sdType = "SDSC";
+  else if (cardType == CARD_SDHC) g_sdType = "SDHC";
+  else g_sdType = "unknown";
+
+  g_sdTotalBytes = SD_MMC.totalBytes();
+  g_sdUsedBytes = SD_MMC.usedBytes();
+  g_sdReady = true;
+  SD_MMC.mkdir("/logs");
+
+  File f = SD_MMC.open("/logs/boot.txt", FILE_APPEND);
+  if (f) {
+    f.printf("boot millis=%lu sd=%s total=%luMB used=%luMB\n",
+             (unsigned long)millis(),
+             g_sdType.c_str(),
+             (unsigned long)(g_sdTotalBytes / (1024ULL * 1024ULL)),
+             (unsigned long)(g_sdUsedBytes / (1024ULL * 1024ULL)));
+    f.close();
+  }
+
+  Serial.printf("SD: OK type=%s total=%luMB used=%luMB\n",
+                g_sdType.c_str(),
+                (unsigned long)(g_sdTotalBytes / (1024ULL * 1024ULL)),
+                (unsigned long)(g_sdUsedBytes / (1024ULL * 1024ULL)));
+}
+
 // -------- Web-GUI --------
 static void handleWebRoot() {
   struct tm now = {};
@@ -1395,6 +1469,12 @@ static void handleWebRoot() {
   html += "<div>Status: 0x" + String(g_lastTouchStatus, HEX) + "</div>";
   html += "<div>Letzter Punkt: X " + String(g_lastTouchX) + " / Y " + String(g_lastTouchY) + "</div>";
   html += "<div>Alter: " + String(g_lastTouchMs ? (millis() - g_lastTouchMs) : 0) + " ms</div></div>";
+  html += F("<div class='card'><h3>microSD</h3>");
+  html += "<div>Status: " + String(g_sdReady ? "bereit" : "nicht bereit") + "</div>";
+  html += "<div>Typ: " + g_sdType + "</div>";
+  html += "<div>Groesse: " + formatStorageMb(g_sdTotalBytes) + "</div>";
+  html += "<div>Benutzt: " + formatStorageMb(g_sdUsedBytes) + "</div>";
+  html += "<div>Log-Test: /logs/boot.txt</div></div>";
   html += F("<div class='card'><h3>WLAN</h3>");
   html += "<div>STA: " + String(WiFi.status() == WL_CONNECTED ? WiFi.SSID() + " / " + WiFi.localIP().toString() : String("nicht verbunden")) + "</div>";
   html += "<div>Gespeichert: " + String(g_wifiSaved ? g_wifiSsid : String("-")) + "</div>";
@@ -1508,12 +1588,24 @@ static void startWebServer() {
   Serial.println("WebGUI: gestartet auf Port 80");
 }
 
+static void coldBootDisplayRetry() {
+  Serial.println("Display: cold-boot retry init...");
+  digitalWrite(PIN_LCD_BL, LOW);
+  delay(120);
+  expanderInit();
+  nativeSt7701Init();
+  nativePanelInit();
+  applyBrightness();
+  drawCurrentPage();
+  Serial.println("Display: cold-boot retry drawn.");
+}
+
 void setup() {
   // Cold-Boot Robustness: erst 250ms warten damit die Versorgung sauber
   // hochlaeuft, bevor wir I2C/Display anpacken. Bei direktem USB-Plug-in
   // war das Display sonst manchmal schwarz weil der PCA9554 noch nicht
   // sicher antwortet und der erste expander-Write ins Leere ging.
-  delay(250);
+  delay(1000);
 
   Serial.begin(115200);
   // USB-CDC: Nicht auf Host warten. Wenn kein Serial-Monitor offen ist,
@@ -1557,6 +1649,9 @@ void setup() {
 
   drawVdoClock();
   Serial.println("VDO clock drawn.");
+  delay(700);
+  coldBootDisplayRetry();
+  initSdCard();
 
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAP("VDO-Clock-Setup", "vdoclock");
