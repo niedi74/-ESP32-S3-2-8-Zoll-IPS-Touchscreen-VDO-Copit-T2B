@@ -110,6 +110,7 @@ static bool g_sdReady = false;
 static String g_sdType = "none";
 static uint64_t g_sdTotalBytes = 0;
 static uint64_t g_sdUsedBytes = 0;
+static uint8_t g_lateDisplayRescuesDone = 0;
 static bool g_redrawClock = false; // Flag: Uhr neu zeichnen (z.B. nach Web-Aenderung)
 static bool g_redrawPage = false;  // Flag: aktuelle Display-Seite neu zeichnen
 static WebServer webServer(80);
@@ -729,6 +730,10 @@ static void nativePanelInit() {
     heap_caps_free(nativeFrame);
     nativeFrame = nullptr;
   }
+  if (presentFrameBuf) {
+    heap_caps_free(presentFrameBuf);
+    presentFrameBuf = nullptr;
+  }
 
   esp_lcd_rgb_panel_config_t cfg = {};
   cfg.clk_src = LCD_CLK_SRC_PLL160M;
@@ -777,6 +782,8 @@ static void nativePanelInit() {
   Serial.printf("RGB panel reset: %s\n", esp_err_to_name(err));
   err = esp_lcd_panel_init(nativePanel);
   Serial.printf("RGB panel init: %s\n", esp_err_to_name(err));
+  err = esp_lcd_panel_disp_on_off(nativePanel, true);
+  Serial.printf("RGB panel on: %s\n", esp_err_to_name(err));
 }
 
 static void nativeFill(uint16_t color) {
@@ -1318,11 +1325,10 @@ static void saveDialScale(int pct) {
 
 static void applyBrightness()
 {
-  int pct = g_brightnessPct;
-  if (pct < 5) pct = 5;
-  if (pct > 100) pct = 100;
-  const int duty = map(pct, 0, 100, 0, 255);
-  analogWrite(PIN_LCD_BL, duty);
+  // Cockpit-Pflicht: Nach USB-C Power muss die Uhr sichtbar bleiben.
+  // PWM/SD-Diagnose ist zweitrangig; Backlight bleibt fuer den Feldtest hart an.
+  pinMode(PIN_LCD_BL, OUTPUT);
+  digitalWrite(PIN_LCD_BL, HIGH);
 }
 
 static void saveBrightness(int pct) {
@@ -1547,6 +1553,14 @@ static void handleWebSet() {
   webServer.send(303);
 }
 
+static void displayRescueReinit(const char *reason, bool refreshSd);
+
+static void handleWebDisplayReinit() {
+  displayRescueReinit("web", true);
+  webServer.sendHeader("Location", "/");
+  webServer.send(303);
+}
+
 static void handleWebWifi() {
   String ssid = webServer.arg("ssid");
   String pass = webServer.arg("pass");
@@ -1580,6 +1594,7 @@ static void handleWebPage() {
 static void startWebServer() {
   webServer.on("/", handleWebRoot);
   webServer.on("/set", handleWebSet);
+  webServer.on("/display_reinit", handleWebDisplayReinit);
   webServer.on("/page", handleWebPage);
   webServer.on("/wifi", handleWebWifi);
   webServer.on("/wifi_clear", handleWebWifiClear);
@@ -1598,6 +1613,32 @@ static void coldBootDisplayRetry() {
   applyBrightness();
   drawCurrentPage();
   Serial.println("Display: cold-boot retry drawn.");
+}
+
+static void displayRescueReinit(const char *reason, bool refreshSd) {
+  Serial.printf("Display: rescue reinit (%s)...\n", reason ? reason : "auto");
+  const bool sdWasReady = g_sdReady;
+  if (refreshSd && sdWasReady) {
+    Serial.println("Display: SD_MMC end before LCD SPI rescue");
+    SD_MMC.end();
+    g_sdReady = false;
+    delay(80);
+  }
+
+  digitalWrite(PIN_LCD_BL, LOW);
+  delay(180);
+  expanderInit();
+  nativeSt7701Init();
+  nativePanelInit();
+  applyBrightness();
+  drawCurrentPage();
+
+  if (refreshSd && sdWasReady) {
+    initSdCard();
+  }
+  delay(50);
+  digitalWrite(PIN_LCD_BL, HIGH);
+  Serial.println("Display: rescue reinit drawn.");
 }
 
 void setup() {
@@ -1651,7 +1692,9 @@ void setup() {
   Serial.println("VDO clock drawn.");
   delay(700);
   coldBootDisplayRetry();
-  initSdCard();
+  // SD bleibt fuer den Cockpit-Feldtest aus. GPIO1/2 teilen sich LCD-Init und
+  // SD_MMC; zuerst muss "USB-C an = Uhr bleibt sichtbar" stabil sein.
+  Serial.println("SD: Autostart deaktiviert fuer Cockpit-Feldtest");
 
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAP("VDO-Clock-Setup", "vdoclock");
