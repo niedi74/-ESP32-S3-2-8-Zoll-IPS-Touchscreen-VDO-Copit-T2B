@@ -1553,8 +1553,6 @@ void setup() {
 
   // Backlight mit gespeicherter Helligkeit einschalten.
   pinMode(PIN_LCD_BL, OUTPUT);
-  analogWriteResolution(PIN_LCD_BL, 8);
-  analogWriteFrequency(PIN_LCD_BL, 5000);
   applyBrightness();
 
   drawVdoClock();
