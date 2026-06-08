@@ -6,3 +6,10 @@
 # Lokale WiFi-Zugangsdaten
 src/wifi_secret.h
 build_err.txt
+
+# Generiert von PlatformIO / ESP-IDF Integration
+.dummy/
+CMakeLists.txt
+dependencies.lock
+managed_components/
+sdkconfig*
