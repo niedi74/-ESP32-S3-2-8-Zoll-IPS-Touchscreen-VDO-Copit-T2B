@@ -51,7 +51,7 @@ static bool  g_lambdaValid = false, g_battValid = false;
 static bool  g_speedValid = false, g_g123Valid = false;
 static bool  g_bleConn = false;
 static uint32_t g_bleLastRx = 0, g_bleRxCnt = 0;
-static String g_bleHubName = "unknown";
+static String g_bleHubName = "---";
 
 static NimBLEClient*      bleClient    = nullptr;
 static NimBLEAddress      bleTarget;
@@ -270,7 +270,7 @@ class SpartanClientCB : public NimBLEClientCallbacks {
   }
   void onDisconnect(NimBLEClient*, int reason) override {
     g_bleConn = false;
-    g_bleHubName = "unknown";
+    g_bleHubName = "---";
     Serial.printf("BLE: getrennt (reason=%d), neuer Scan\n", reason);
     bleNextScanAt = millis() + 15000;
   }
@@ -284,13 +284,13 @@ class SpartanScanCB : public NimBLEScanCallbacks {
     String addr = dev->getAddress().toString().c_str();
     addr.toLowerCase();
     String name = dev->getName().c_str();
-    if (name.length() > 0) g_bleHubName = name;
+    g_bleHubName = name.length() > 0 ? name : "---";
     if (addr == SPARTAN_MAC ||
         dev->isAdvertisingService(NimBLEUUID(SPARTAN_SVC))) {
       bleTarget    = dev->getAddress();
       bleDoConnect = true;
       NimBLEDevice::getScan()->stop();
-      Serial.printf("BLE: Spartan-Hub gefunden (%s)\n", addr.c_str());
+      Serial.printf("BLE: Spartan-Hub gefunden (%s / %s)\n", addr.c_str(), name.c_str());
     }
   }
   void onScanEnd(const NimBLEScanResults&, int) override {
@@ -814,7 +814,7 @@ static void saveFeatures(bool wifi, bool ble) {
   if (!g_featureBle) {
     if (bleClient && bleClient->isConnected()) bleClient->disconnect();
     g_bleConn    = false;
-    g_bleHubName = "unknown";
+    g_bleHubName = "---";
     bleDoConnect = false;
     bleNextScanAt = 0;
     Serial.println("BLE: AUS");
