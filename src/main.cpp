@@ -21,18 +21,6 @@
 
 #define FEATURE_TOUCH 1
 
-// #region agent log
-static void agentDbgLog(const char *hypothesisId, const char *location, const char *message,
-                        uint32_t a = 0, uint32_t b = 0, uint32_t c = 0, uint32_t d = 0) {
-  Serial.printf("{\"sessionId\":\"bd0449\",\"hypothesisId\":\"%s\",\"location\":\"%s\","
-                "\"message\":\"%s\",\"data\":{\"a\":%lu,\"b\":%lu,\"c\":%lu,\"d\":%lu},"
-                "\"timestamp\":%lu,\"runId\":\"pre-fix\"}\n",
-                hypothesisId, location, message,
-                (unsigned long)a, (unsigned long)b, (unsigned long)c, (unsigned long)d,
-                (unsigned long)millis());
-}
-// #endregion
-
 // ---- Touch / I2C ----
 #define PIN_TOUCH_INT      16
 #define GT911_ADDR_PRIMARY 0x5D
@@ -441,39 +429,21 @@ static void gt911Init() {
   Serial.println("GT911: reset/probe INT low");
   gt911ResetAddressMode(false);
   if (gt911Probe()) {
-    // #region agent log
-    agentDbgLog("H1", "main.cpp:gt911Init", "probe_ok_int_low", gt911Found, gt911Addr, 0, 0);
-    // #endregion
     return;
   }
   Serial.println("GT911: reset/probe INT high");
   gt911ResetAddressMode(true);
   if (gt911Probe()) {
-    // #region agent log
-    agentDbgLog("H1", "main.cpp:gt911Init", "probe_ok_int_high", gt911Found, gt911Addr, 0, 0);
-    // #endregion
     return;
   }
   Serial.println("GT911: not found on 0x5D/0x14");
-  // #region agent log
-  agentDbgLog("H1", "main.cpp:gt911Init", "probe_fail", 0, 0, 0, 0);
-  // #endregion
 }
 
 static bool readTouch(uint16_t *x, uint16_t *y) {
-  static uint8_t s_lastFailReason = 0;
-  static uint32_t s_failLogAt = 0;
   uint8_t status = 0;
   if (!i2cRegRead16(gt911Addr, GT911_READ_XY, &status, 1)) {
     uint8_t other = (gt911Addr == GT911_ADDR_PRIMARY) ? GT911_ADDR_ALT : GT911_ADDR_PRIMARY;
     if (!i2cRegRead16(other, GT911_READ_XY, &status, 1)) {
-      // #region agent log
-      if (s_lastFailReason != 1 || millis() - s_failLogAt > 2000) {
-        s_lastFailReason = 1;
-        s_failLogAt = millis();
-        agentDbgLog("H2", "main.cpp:readTouch", "i2c_both_addr_fail", gt911Addr, other, 0, 0);
-      }
-      // #endregion
       return false;
     }
     gt911Addr  = other;
@@ -489,22 +459,12 @@ static bool readTouch(uint16_t *x, uint16_t *y) {
   uint8_t points = status & 0x0F;
   if (points == 0 || points > 5) {
     i2cRegWrite16(gt911Addr, GT911_READ_XY, &clear, 1);
-    // #region agent log
-    if (s_lastFailReason != 3 || millis() - s_failLogAt > 2000) {
-      s_lastFailReason = 3;
-      s_failLogAt = millis();
-      agentDbgLog("H2", "main.cpp:readTouch", "bad_points", status, points, gt911Addr, 0);
-    }
-    // #endregion
     return false;
   }
   uint8_t point[8] = {0};
   bool ok = i2cRegRead16(gt911Addr, GT911_READ_XY + 1, point, sizeof(point));
   i2cRegWrite16(gt911Addr, GT911_READ_XY, &clear, 1);
   if (!ok) {
-    // #region agent log
-    agentDbgLog("H2", "main.cpp:readTouch", "point_read_fail", status, gt911Addr, 0, 0);
-    // #endregion
     return false;
   }
   // GT911 ab 0x814F: [TrackID, X-low, X-high, Y-low, Y-high, Size-low, ...]
@@ -527,9 +487,6 @@ static bool readTouch(uint16_t *x, uint16_t *y) {
   g_lastTouchX  = *x;
   g_lastTouchY  = *y;
   g_lastTouchMs = millis();
-  // #region agent log
-  agentDbgLog("H4", "main.cpp:readTouch", "touch_hit", *x, *y, status, points);
-  // #endregion
   return true;
 }
 
@@ -1351,9 +1308,6 @@ void setup() {
   } else {
     Serial.println("IMU: QMI8658 NOT found");
   }
-  // #region agent log
-  agentDbgLog("H5", "main.cpp:setup", "post_imu_gt911", g_imuPresent, gt911Found, gt911Addr, 0);
-  // #endregion
 
   initTimeSource();
   hal_backlight(true);
@@ -1407,10 +1361,6 @@ void loop() {
     const uint32_t durMs = touchLastSeenMs - touchStartMs;
     const uint16_t tapX = touchLastX ? touchLastX : touchStartX;
     const uint16_t tapY = touchLastY ? touchLastY : touchStartY;
-    // #region agent log
-    agentDbgLog("H4", "main.cpp:loop", "release_check",
-                durMs, nowMs - lastTouch, touchLongHandled ? 1u : 0u, currentPage);
-    // #endregion
     touchActive = false;
     if (!touchLongHandled && durMs < 600 && nowMs - lastTouch > 350) {
       lastTouch = nowMs;
