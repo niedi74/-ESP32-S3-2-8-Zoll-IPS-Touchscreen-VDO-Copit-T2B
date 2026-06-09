@@ -51,6 +51,7 @@ static bool  g_lambdaValid = false, g_battValid = false;
 static bool  g_speedValid = false, g_g123Valid = false;
 static bool  g_bleConn = false;
 static uint32_t g_bleLastRx = 0, g_bleRxCnt = 0;
+static String g_bleHubName = "unknown";
 
 static NimBLEClient*      bleClient    = nullptr;
 static NimBLEAddress      bleTarget;
@@ -269,6 +270,7 @@ class SpartanClientCB : public NimBLEClientCallbacks {
   }
   void onDisconnect(NimBLEClient*, int reason) override {
     g_bleConn = false;
+    g_bleHubName = "unknown";
     Serial.printf("BLE: getrennt (reason=%d), neuer Scan\n", reason);
     bleNextScanAt = millis() + 15000;
   }
@@ -282,7 +284,8 @@ class SpartanScanCB : public NimBLEScanCallbacks {
     String addr = dev->getAddress().toString().c_str();
     addr.toLowerCase();
     String name = dev->getName().c_str();
-    if (addr == SPARTAN_MAC || name == SPARTAN_HUB_NAME ||
+    if (name.length() > 0) g_bleHubName = name;
+    if (addr == SPARTAN_MAC ||
         dev->isAdvertisingService(NimBLEUUID(SPARTAN_SVC))) {
       bleTarget    = dev->getAddress();
       bleDoConnect = true;
@@ -727,6 +730,7 @@ static void drawHubPage() {
   fillFrame(RGB565_BLACK);
   drawCircleLine(240, 240, 216, 3, RGB565(150, 70, 180));
   drawTextCentered(240, 54, "HUB", RGB565(205, 120, 230), 5);
+  drawTextCentered(240, 84, g_bleHubName.c_str(), RGB565(150, 150, 150), 2);
   char buf[24];
   drawDataRow(112, "BLE",   g_bleConn ? "OK" : "SCAN",
               g_bleConn ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
@@ -759,6 +763,7 @@ static void drawSetupPage() {
               g_featureWifi && WiFi.status() == WL_CONNECTED ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
   drawDataRow(272, "BLE",   g_featureBle ? (g_bleConn ? "OK" : "AN") : "AUS",
               g_featureBle && g_bleConn ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
+  drawDataRow(312, "HUB",   g_bleHubName.c_str(), RGB565(150, 150, 150));
   drawTextCentered(240, 370, "TIP MENU", RGB565(180, 180, 170), 2);
   presentFrame();
 }
@@ -809,6 +814,7 @@ static void saveFeatures(bool wifi, bool ble) {
   if (!g_featureBle) {
     if (bleClient && bleClient->isConnected()) bleClient->disconnect();
     g_bleConn    = false;
+    g_bleHubName = "unknown";
     bleDoConnect = false;
     bleNextScanAt = 0;
     Serial.println("BLE: AUS");
