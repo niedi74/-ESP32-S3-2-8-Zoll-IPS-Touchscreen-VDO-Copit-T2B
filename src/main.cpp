@@ -71,6 +71,9 @@ static bool      touchSeen      = false;
 static char      g_ipStr[20]    = "---";
 static int       g_dialScalePct = 100;
 static int       g_brightnessPct = 100;
+static int       g_rotationDeg  = 0;
+static float     g_rotSin       = 0.0f;
+static float     g_rotCos       = 1.0f;
 static bool      g_featureWifi  = true;
 static bool      g_featureBle   = false;
 static bool      g_webStarted   = false;
@@ -80,6 +83,7 @@ static WebServer webServer(80);
 static void startWebServer();   // forward declaration
 static void reconnectWifiProfile();
 static void cycleWifiProfile();
+static void updateRotationCache();
 
 struct WifiProfile {
   const char* ssid;
@@ -454,8 +458,21 @@ static bool readTouch(uint16_t *x, uint16_t *y) {
   bool ok = i2cRegRead16(gt911Addr, GT911_READ_XY + 1, point, sizeof(point));
   i2cRegWrite16(gt911Addr, GT911_READ_XY, &clear, 1);
   if (!ok) return false;
-  *x = (uint16_t)point[2] | ((uint16_t)point[3] << 8);
-  *y = (uint16_t)point[4] | ((uint16_t)point[5] << 8);
+  uint16_t rawX = (uint16_t)point[2] | ((uint16_t)point[3] << 8);
+  uint16_t rawY = (uint16_t)point[4] | ((uint16_t)point[5] << 8);
+  if (g_rotationDeg == 0) {
+    *x = rawX;
+    *y = rawY;
+  } else {
+    float dx = (float)rawX - 239.5f;
+    float dy = (float)rawY - 239.5f;
+    int lx = (int)lroundf(dx * g_rotCos + dy * g_rotSin + 239.5f);
+    int ly = (int)lroundf(-dx * g_rotSin + dy * g_rotCos + 239.5f);
+    if (lx < 0) lx = 0; else if (lx > 479) lx = 479;
+    if (ly < 0) ly = 0; else if (ly > 479) ly = 479;
+    *x = (uint16_t)lx;
+    *y = (uint16_t)ly;
+  }
   g_lastTouchX  = *x;
   g_lastTouchY  = *y;
   g_lastTouchMs = millis();
@@ -469,7 +486,15 @@ static void fillFrame(uint16_t c) { hal_fill(c); }
 
 static void setPixel(int x, int y, uint16_t color) {
   uint16_t *fb = hal_fb();
-  if (fb && (unsigned)x < 480 && (unsigned)y < 480) fb[y * 480 + x] = color;
+  if (!fb || (unsigned)x >= 480 || (unsigned)y >= 480) return;
+  if (g_rotationDeg != 0) {
+    float dx = (float)x - 239.5f;
+    float dy = (float)y - 239.5f;
+    x = (int)lroundf(dx * g_rotCos - dy * g_rotSin + 239.5f);
+    y = (int)lroundf(dx * g_rotSin + dy * g_rotCos + 239.5f);
+    if ((unsigned)x >= 480 || (unsigned)y >= 480) return;
+  }
+  fb[y * 480 + x] = color;
 }
 
 static void fillRectFast(int x, int y, int w, int h, uint16_t color) {
@@ -626,20 +651,38 @@ static void copyVdoDialToFrame() {
   int pct = g_dialScalePct;
   if (pct < 30) pct = 30;
   if (pct > 100) pct = 100;
-  if (pct == 100) {
+  if (pct == 100 && g_rotationDeg == 0) {
     for (int i = 0; i < 480 * 480; i++) fb[i] = pgm_read_word(&VDO_DIAL_480_RGB565[i]);
     return;
   }
   for (int i = 0; i < 480 * 480; i++) fb[i] = RGB565_BLACK;
   int outSize = (480 * pct) / 100;
   int offset  = (480 - outSize) / 2;
-  for (int oy = 0; oy < outSize; oy++) {
-    int sy     = (oy * 480) / outSize;
-    int dstRow = (offset + oy) * 480 + offset;
-    int srcRow = sy * 480;
-    for (int ox = 0; ox < outSize; ox++) {
-      int sx = (ox * 480) / outSize;
-      fb[dstRow + ox] = pgm_read_word(&VDO_DIAL_480_RGB565[srcRow + sx]);
+  if (g_rotationDeg == 0) {
+    for (int oy = 0; oy < outSize; oy++) {
+      int sy     = (oy * 480) / outSize;
+      int dstRow = (offset + oy) * 480 + offset;
+      int srcRow = sy * 480;
+      for (int ox = 0; ox < outSize; ox++) {
+        int sx = (ox * 480) / outSize;
+        fb[dstRow + ox] = pgm_read_word(&VDO_DIAL_480_RGB565[srcRow + sx]);
+      }
+    }
+    return;
+  }
+  for (int py = 0; py < 480; py++) {
+    for (int px = 0; px < 480; px++) {
+      float dx = (float)px - 239.5f;
+      float dy = (float)py - 239.5f;
+      int lx = (int)lroundf(dx * g_rotCos + dy * g_rotSin + 239.5f);
+      int ly = (int)lroundf(-dx * g_rotSin + dy * g_rotCos + 239.5f);
+      int ox = lx - offset;
+      int oy = ly - offset;
+      if ((unsigned)ox < (unsigned)outSize && (unsigned)oy < (unsigned)outSize) {
+        int sx = (ox * 480) / outSize;
+        int sy = (oy * 480) / outSize;
+        fb[py * 480 + px] = pgm_read_word(&VDO_DIAL_480_RGB565[sy * 480 + sx]);
+      }
     }
   }
 }
@@ -796,8 +839,8 @@ static void drawSetupPage() {
   drawDataRow(112, "UHR",   buf, RGB565(235, 235, 225));
   snprintf(buf, sizeof(buf), "%d %%", g_brightnessPct);
   drawDataRow(152, "HELL",  buf, RGB565(235, 235, 225));
-  drawDataRow(192, "TOUCH", FEATURE_TOUCH ? (touchSeen ? "AKTIV" : "WARTET") : "AUS",
-              FEATURE_TOUCH && touchSeen ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
+  snprintf(buf, sizeof(buf), "%d DEG", g_rotationDeg);
+  drawDataRow(192, "ROT",   buf, RGB565(235, 235, 225));
   if (g_featureWifi && strlen(currentWifiSsid()) > 0) {
     snprintf(buf, sizeof(buf), "%s", currentWifiSsid());
     drawDataRow(232, "WIFI", buf,
@@ -827,6 +870,7 @@ static void loadSettings() {
   p.begin("clock", true);
   g_dialScalePct  = p.getInt("scale",     100);
   g_brightnessPct = p.getInt("bright",    100);
+  g_rotationDeg   = p.getInt("rot_deg",   0);
   g_wifiProfile   = p.getUChar("wifi_prof", 0);
   if (g_wifiProfile >= wifiProfileCount()) g_wifiProfile = 0;
   g_featureWifi   = p.getBool("feat_wifi", strlen(currentWifiSsid()) > 0);
@@ -836,6 +880,9 @@ static void loadSettings() {
   if (g_dialScalePct  > 100) g_dialScalePct  = 100;
   if (g_brightnessPct < 5)   g_brightnessPct = 5;
   if (g_brightnessPct > 100) g_brightnessPct = 100;
+  g_rotationDeg %= 360;
+  if (g_rotationDeg < 0) g_rotationDeg += 360;
+  updateRotationCache();
 }
 
 static void saveDialScale(int pct) {
@@ -855,6 +902,23 @@ static void saveBrightness(int pct) {
   Preferences p;
   p.begin("clock", false);
   p.putInt("bright", pct);
+  p.end();
+}
+
+static void updateRotationCache() {
+  g_rotationDeg %= 360;
+  if (g_rotationDeg < 0) g_rotationDeg += 360;
+  float rad = (float)g_rotationDeg * PI / 180.0f;
+  g_rotSin = sinf(rad);
+  g_rotCos = cosf(rad);
+}
+
+static void saveRotation(int deg) {
+  g_rotationDeg = deg;
+  updateRotationCache();
+  Preferences p;
+  p.begin("clock", false);
+  p.putInt("rot_deg", g_rotationDeg);
   p.end();
 }
 
@@ -952,6 +1016,14 @@ static void handleWebRoot() {
     "<br><button type='submit'>&Uuml;bernehmen</button></form>"
     "<div><a href='/set?scale=100'>100%</a> &middot; <a href='/set?scale=90'>90%</a> &middot; "
     "<a href='/set?scale=80'>80%</a> &middot; <a href='/set?scale=70'>70%</a></div></div>");
+  html += F("<div class='card'><h3>Display-Rotation</h3><div class='val'>");
+  html += String(g_rotationDeg);
+  html += F("&deg;</div><a href='/set?rot_delta=-1'><button>- 1&deg;</button></a>"
+            "<a href='/set?rot_delta=1'><button>+ 1&deg;</button></a><br>"
+            "<a href='/set?rot_delta=-5'><button>- 5&deg;</button></a>"
+            "<a href='/set?rot_delta=5'><button>+ 5&deg;</button></a>"
+            "<div><a href='/set?rot=0'>0&deg;</a> &middot; <a href='/set?rot=90'>90&deg;</a> &middot; "
+            "<a href='/set?rot=180'>180&deg;</a> &middot; <a href='/set?rot=270'>270&deg;</a></div></div>");
   html += F("<p style='color:#666'>VW T2b Cockpit &middot; ESP32-S3 2.8\"</p></body></html>");
   webServer.send(200, "text/html", html);
 }
@@ -961,6 +1033,16 @@ static void handleWebSet() {
     saveDialScale(webServer.arg("scale").toInt());
     g_redrawPage = true;
     Serial.printf("Web: Zifferblatt-Groesse = %d%%\n", g_dialScalePct);
+  }
+  if (webServer.hasArg("rot_delta")) {
+    saveRotation(g_rotationDeg + webServer.arg("rot_delta").toInt());
+    g_redrawPage = true;
+    Serial.printf("Web: Rotation = %d deg\n", g_rotationDeg);
+  }
+  if (webServer.hasArg("rot")) {
+    saveRotation(webServer.arg("rot").toInt());
+    g_redrawPage = true;
+    Serial.printf("Web: Rotation = %d deg\n", g_rotationDeg);
   }
   webServer.sendHeader("Location", "/");
   webServer.send(303);
@@ -1018,6 +1100,10 @@ static void handleSetupLongPress(uint16_t y, uint32_t durMs) {
     saveBrightness(next);
     drawSetupPage();
     Serial.printf("setup long: brightness=%d%%\n", g_brightnessPct);
+  } else if (y >= 174 && y < 214) {
+    saveRotation(g_rotationDeg + 1);
+    drawSetupPage();
+    Serial.printf("setup long: rotation=%d deg\n", g_rotationDeg);
   } else if (y >= 214 && y < 254) {
     cycleWifiProfile();
     drawSetupPage();
@@ -1187,8 +1273,11 @@ void loop() {
         else if (cmd == "ble:off") { saveFeatures(g_featureWifi, false); }
         else if (cmd == "wifi:next") { cycleWifiProfile(); g_redrawPage = true; }
         else if (cmd == "wifi:off")  { saveFeatures(false, g_featureBle); g_redrawPage = true; }
+        else if (cmd == "rot:+") { saveRotation(g_rotationDeg + 1); g_redrawPage = true; }
+        else if (cmd == "rot:-") { saveRotation(g_rotationDeg - 1); g_redrawPage = true; }
+        else if (cmd.startsWith("rot:")) { saveRotation(cmd.substring(4).toInt()); g_redrawPage = true; }
         else if (cmd == "clock")   { currentPage = 0; drawVdoClock(); }
-        else { Serial.println("Commands: ble:on | ble:off | wifi:next | wifi:off | clock"); }
+        else { Serial.println("Commands: ble:on | ble:off | wifi:next | wifi:off | rot:+ | rot:- | rot:NN | clock"); }
       }
     } else if (serialLine.length() < 64) {
       serialLine += c;
