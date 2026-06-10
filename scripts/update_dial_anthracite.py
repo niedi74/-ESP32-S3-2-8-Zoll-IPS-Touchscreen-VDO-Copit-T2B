@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""Retarget VDO dial face background to VW T2 anthracite and remove outer rings.
+"""Retarget VDO dial face background to VW T2 tacho anthracite (scale-crop strategy).
 
-Samples the anthracite tone from reference photos in docs/photos/, remaps neutral
-face-background pixels, and replaces the outer white chrome ring plus the dark
-and metallic bezel ring so the dial fills the full 480 px circle edge-to-edge.
-Numerals, tick marks, and logos are preserved.
+Loads the original 480x480 dial bitmap (git 81f2149), remaps only neutral
+face-background pixels to the flat anthracite tone sampled from the cockpit
+tacho, and leaves the outer chrome ring, bezel, numerals, and tick marks
+untouched. Firmware zooms above 100% so the chrome ring is cropped off-screen.
 """
 
 from __future__ import annotations
 
 import re
+import subprocess
 from pathlib import Path
 
 import numpy as np
@@ -17,7 +18,21 @@ from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
 HEADER = ROOT / "src" / "vdo_dial_480_rgb565.h"
+SOURCE_COMMIT = "81f2149:src/vdo_dial_480_rgb565.h"
+RECOMMENDED_SCALE_PCT = 115
+# Cockpit photo with tacho (left) + VDO clock (right) for color reference.
+_COCKPIT_NAME = (
+    "c__Users_niedi01_AppData_Roaming_Cursor_User_workspaceStorage_empty-window_images_"
+    "image-86fe423c-34c6-4c4b-8937-82bd7f259f11.png"
+)
+COCKPIT_CANDIDATES = [
+    Path.home()
+    / ".cursor/projects/d-claude-waveshare-vdo-clock/assets"
+    / _COCKPIT_NAME,
+    ROOT / "assets" / _COCKPIT_NAME,
+]
 REF_PHOTOS = [
+    *[p for p in COCKPIT_CANDIDATES if p.exists()],
     ROOT / "docs/photos/20260524_173440.jpg",
     ROOT / "docs/photos/20260524_173456.jpg",
     ROOT / "docs/photos/20260524_173546.jpg",
@@ -26,6 +41,8 @@ REF_PHOTOS = [
 ]
 
 CX = CY = 240
+# VW T2 tacho flat face (sampled from cockpit photo, left instrument).
+ANTHRACITE = np.array([55, 55, 57], dtype=np.float32)
 
 
 def rgb565_to_rgb(color: int) -> np.ndarray:
@@ -48,33 +65,69 @@ def sat(rgb: np.ndarray) -> int:
     return int(max(rgb) - min(rgb))
 
 
+def sample_tacho_face(arr: np.ndarray) -> list[tuple[int, int, int]]:
+    """Sample flat face from left tacho in wide cockpit photo."""
+    h, w = arr.shape[:2]
+    if w < h * 1.2:
+        return []
+    tcx, tcy = int(w * 0.24), int(h * 0.42)
+    max_r = min(tcx, tcy, w - tcx, h - tcy)
+    samples: list[tuple[int, int, int]] = []
+    for y in range(h):
+        for x in range(w):
+            dx, dy = x - tcx, y - tcy
+            r = (dx * dx + dy * dy) ** 0.5
+            if not (0.12 * max_r < r < 0.32 * max_r):
+                continue
+            rgb = arr[y, x]
+            l = lum(rgb)
+            if 20 < l < 70 and sat(rgb) < 30:
+                samples.append(tuple(int(v) for v in rgb))
+    return samples
+
+
+def sample_dial_face(arr: np.ndarray) -> list[tuple[int, int, int]]:
+    """Sample flat face from centred round dial photo."""
+    h, w = arr.shape[:2]
+    cx, cy = w // 2, h // 2
+    max_r = min(cx, cy)
+    samples: list[tuple[int, int, int]] = []
+    for y in range(h):
+        for x in range(w):
+            dx, dy = x - cx, y - cy
+            r = (dx * dx + dy * dy) ** 0.5
+            if not (0.15 * max_r < r < 0.38 * max_r):
+                continue
+            rgb = arr[y, x]
+            l = lum(rgb)
+            if 35 < l < 75 and sat(rgb) < 25:
+                samples.append(tuple(int(v) for v in rgb))
+    return samples
+
+
 def sample_anthracite() -> np.ndarray:
-    """Median anthracite from flat dial-face regions in reference photos."""
+    """Median anthracite from tacho face in cockpit / docs reference photos."""
     samples: list[tuple[int, int, int]] = []
     for path in REF_PHOTOS:
         if not path.exists():
             continue
         arr = np.array(Image.open(path).convert("RGB"))
-        h, w = arr.shape[:2]
-        cx, cy = w // 2, h // 2
-        max_r = min(cx, cy)
-        for y in range(h):
-            for x in range(w):
-                dx, dy = x - cx, y - cy
-                r = (dx * dx + dy * dy) ** 0.5
-                if not (0.15 * max_r < r < 0.38 * max_r):
-                    continue
-                rgb = arr[y, x]
-                l = lum(rgb)
-                if 35 < l < 75 and sat(rgb) < 25:
-                    samples.append(tuple(int(v) for v in rgb))
-    if not samples:
-        raise RuntimeError("No anthracite samples found in reference photos")
-    return np.median(samples, axis=0).astype(np.float32)
+        tacho = sample_tacho_face(arr)
+        if tacho:
+            samples.extend(tacho)
+            continue
+        samples.extend(sample_dial_face(arr))
+    if samples:
+        return np.median(samples, axis=0).astype(np.float32)
+    return ANTHRACITE.copy()
 
 
-def load_dial() -> np.ndarray:
-    content = HEADER.read_text(encoding="utf-8")
+def load_dial_from_git(commit_path: str) -> np.ndarray:
+    text = subprocess.check_output(["git", "show", commit_path], text=True, cwd=ROOT)
+    return parse_header_text(text)
+
+
+def parse_header_text(content: str) -> np.ndarray:
     start = content.index("{") + 1
     end = content.rindex("}")
     vals = np.array(
@@ -86,35 +139,15 @@ def load_dial() -> np.ndarray:
     return vals.reshape(480, 480).copy()
 
 
+def load_dial() -> np.ndarray:
+    return load_dial_from_git(SOURCE_COMMIT)
+
+
 def is_face_gray(rgb: np.ndarray, radius: float) -> bool:
     l = lum(rgb)
     if radius > 212 or l < 22 or l > 82 or sat(rgb) > 18:
         return False
     if l < 28 and radius > 200:
-        return False
-    return True
-
-
-def is_white_ring(rgb: np.ndarray, radius: float) -> bool:
-    return lum(rgb) > 195 and 207 <= radius <= 237
-
-
-def is_marking(rgb: np.ndarray, radius: float) -> bool:
-    """Keep numerals, ticks, logos, and their metallic edges."""
-    l = lum(rgb)
-    s = sat(rgb)
-    if l >= 112:
-        return True
-    if s >= 20:
-        return True
-    if radius < 195 and l >= 58 and s >= 6:
-        return True
-    return False
-
-
-def is_outer_bezel(radius: float, rgb: np.ndarray) -> bool:
-    """Dark/metallic outer ring between face and display edge."""
-    if radius < 198 or is_marking(rgb, radius):
         return False
     return True
 
@@ -126,16 +159,12 @@ def is_outside_circle(radius: float) -> bool:
 def process_dial(dial: np.ndarray, target: np.ndarray) -> np.ndarray:
     old_mid = 48.0
     out = dial.copy()
-    target_px = target.astype(int)
+    target_px = np.clip(target, 0, 255).astype(int)
     for y in range(480):
         for x in range(480):
             rgb = rgb565_to_rgb(int(out[y, x]))
             radius = ((x - CX) ** 2 + (y - CY) ** 2) ** 0.5
-            if is_white_ring(rgb, radius):
-                out[y, x] = rgb_to_rgb565(*target_px)
-            elif is_outside_circle(radius):
-                out[y, x] = rgb_to_rgb565(*target_px)
-            elif is_outer_bezel(radius, rgb):
+            if is_outside_circle(radius):
                 out[y, x] = rgb_to_rgb565(*target_px)
             elif is_face_gray(rgb, radius):
                 ratio = lum(rgb) / old_mid
@@ -144,12 +173,14 @@ def process_dial(dial: np.ndarray, target: np.ndarray) -> np.ndarray:
     return out
 
 
-def write_header(dial: np.ndarray) -> None:
+def write_header(dial: np.ndarray, target: np.ndarray) -> None:
+    t = tuple(np.clip(target, 0, 255).astype(int))
     lines = [
         "#pragma once\n",
         "#include <Arduino.h>\n",
         "\n",
-        "// Anthracite dial face matched to VW T2 cockpit reference; outer rings removed.\n",
+        f"// Tacho-matched anthracite face RGB{t}; chrome ring kept for scale-crop.\n",
+        f"// Render at {RECOMMENDED_SCALE_PCT}% in firmware to clip the ring off-screen.\n",
         "// 480x480 RGB565 VDO dial face without hands; firmware draws live hands on top.\n",
         "static const uint16_t VDO_DIAL_480_RGB565[480 * 480] PROGMEM = {\n",
     ]
@@ -166,9 +197,10 @@ def write_header(dial: np.ndarray) -> None:
 
 def main() -> None:
     target = sample_anthracite()
-    print(f"Target anthracite RGB: {tuple(target.astype(int))}")
+    print(f"Target tacho anthracite RGB: {tuple(target.astype(int))}")
+    print(f"Recommended firmware scale: {RECOMMENDED_SCALE_PCT}%")
     dial = process_dial(load_dial(), target)
-    write_header(dial)
+    write_header(dial, target)
     print(f"Updated {HEADER}")
 
 
