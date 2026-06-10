@@ -21,6 +21,7 @@
 #include "vdo_dial_480_rgb565.h"
 #include <sys/time.h>
 #include <time.h>
+#include <cstring>
 
 #define FEATURE_TOUCH 1
 
@@ -52,7 +53,8 @@
 #define NUS_RX          "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
 #define NUS_TX          "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
 #define DEFAULT_123_MAC "ef:a8:b2:de:e0:9e"
-#define BLE_SCAN_MAX    8
+#define BLE_SCAN_MAX    32
+#define BLE_DISCOVERY_SCAN_MS 5000
 
 enum BleConnMode : uint8_t { BLE_MODE_DIRECT_123 = 0, BLE_MODE_SPARTAN_HUB = 1 };
 
@@ -78,7 +80,8 @@ static NimBLEAddress      bleTarget;
 static volatile bool      bleDoConnect = false;
 static uint32_t           bleNextScanAt = 0;
 static BleConnMode        g_bleConnMode = BLE_MODE_SPARTAN_HUB;
-static char               g_bleTargetMac[18] = DEFAULT_123_MAC;
+static char               g_bleTargetMac[18] = DEFAULT_123_MAC;  // 123 direkt
+static char               g_bleHubMac[18]    = "";               // Hub (leer bis Scan/Connect)
 static BleScanEntry       g_bleScanList[BLE_SCAN_MAX];
 static uint8_t            g_bleScanCount = 0;
 static volatile bool      g_bleDiscoveryScan = false;
@@ -95,7 +98,16 @@ static uint8_t  g_lastTouchStatus = 0;
 static uint8_t   currentPage    = 0;
 static bool      touchSeen      = false;
 static char      g_ipStr[20]    = "---";
-static int       g_dialScalePct = 100;
+static const int DIAL_SCALE_DEFAULT = 115;  // sweet spot: fills display, chrome cropped
+static const int DIAL_SCALE_MIN     = 30;
+static const int DIAL_SCALE_MAX     = 120;
+static const int DIAL_CENTER        = 240;
+static const int DIAL_CENTER_OFF_X_DEFAULT = -4;  // source bitmap visual center correction
+static const int DIAL_CENTER_OFF_Y_DEFAULT = -2;
+static const uint16_t DIAL_FACE_BG  = RGB565(52, 47, 45);
+static int       g_dialScalePct = DIAL_SCALE_DEFAULT;
+static int       g_dialCenterOffsetX = DIAL_CENTER_OFF_X_DEFAULT;
+static int       g_dialCenterOffsetY = DIAL_CENTER_OFF_Y_DEFAULT;
 static int       g_brightnessPct = 100;
 static int       g_rotationDeg  = 0;
 static float     g_rotSin       = 0.0f;
@@ -111,6 +123,7 @@ static const char* g_otaBootLabel = "normal";
 static uint8_t   g_wifiProfile  = 0;
 static WebServer webServer(80);
 static void startWebServer();   // forward declaration
+static void bleAbortDiscoveryScan();
 static void reconnectWifiProfile();
 static void cycleWifiProfile();
 static void updateRotationCache();
@@ -169,6 +182,7 @@ static void webOtaBeginUpload(const char* filename) {
   hal_pause_for_ota(true);
   WiFi.setSleep(WIFI_PS_NONE);
   if (g_featureBle) {
+    bleAbortDiscoveryScan();
     NimBLEDevice::getScan()->stop();
     if (bleClient && bleClient->isConnected()) bleClient->disconnect();
   }
@@ -410,11 +424,28 @@ static void clearBleLiveValues() {
   g_bleLastRx = 0;
 }
 
+static void bleWaitScanStopped(NimBLEScan* s, uint32_t timeoutMs) {
+  const uint32_t until = millis() + timeoutMs;
+  while (s->isScanning() && millis() < until) {
+    delay(10);
+    yield();
+  }
+}
+
+static void bleAbortDiscoveryScan() {
+  if (!g_bleDiscoveryScan) return;
+  auto* s = NimBLEDevice::getScan();
+  s->stop();
+  bleWaitScanStopped(s, 500);
+  g_bleDiscoveryScan = false;
+}
+
 static void disconnectBleForModeChange() {
   bleDoConnect = false;
   g_bleConn = false;
   g_bleHubName = "---";
   clearBleLiveValues();
+  bleAbortDiscoveryScan();
   NimBLEDevice::getScan()->stop();
   if (bleClient && bleClient->isConnected()) bleClient->disconnect();
   bleNextScanAt = millis() + 2000;
@@ -428,13 +459,30 @@ static void saveBleConnMode(BleConnMode mode) {
   p.end();
 }
 
-static void saveBleTargetMac(const char* mac) {
+static void saveBleMac123(const char* mac) {
   strncpy(g_bleTargetMac, mac, sizeof(g_bleTargetMac) - 1);
   g_bleTargetMac[sizeof(g_bleTargetMac) - 1] = 0;
   Preferences p;
   p.begin("clock", false);
-  p.putString("ble_mac", g_bleTargetMac);
+  p.putString("ble_mac_123", g_bleTargetMac);
   p.end();
+}
+
+static void saveBleMacHub(const char* mac) {
+  strncpy(g_bleHubMac, mac, sizeof(g_bleHubMac) - 1);
+  g_bleHubMac[sizeof(g_bleHubMac) - 1] = 0;
+  Preferences p;
+  p.begin("clock", false);
+  p.putString("ble_mac_hub", g_bleHubMac);
+  p.end();
+}
+
+static const char* bleTargetDisplay() {
+  if (g_bleConnMode == BLE_MODE_SPARTAN_HUB) {
+    if (g_bleHubMac[0] != '\0') return g_bleHubMac;
+    return SPARTAN_NAME;
+  }
+  return g_bleTargetMac;
 }
 
 static void cycleBleConnMode() {
@@ -551,6 +599,14 @@ static void bleScanListAdd(const NimBLEAdvertisedDevice* dev) {
   for (uint8_t i = 0; i < g_bleScanCount; i++) {
     if (macEquals(addr, g_bleScanList[i].mac)) {
       g_bleScanList[i].rssi = dev->getRSSI();
+      String name = dev->getName().c_str();
+      if (name.length() > 0) {
+        strncpy(g_bleScanList[i].name, name.c_str(), sizeof(g_bleScanList[i].name) - 1);
+        g_bleScanList[i].name[sizeof(g_bleScanList[i].name) - 1] = 0;
+      }
+      g_bleScanList[i].spartan = dev->isAdvertisingService(NimBLEUUID(SPARTAN_SVC)) ||
+                                 name == SPARTAN_NAME;
+      g_bleScanList[i].nus = dev->isAdvertisingService(NimBLEUUID(NUS_SVC));
       return;
     }
   }
@@ -570,9 +626,9 @@ static bool bleScanMatchesTarget(const NimBLEAdvertisedDevice* dev, String& addr
   addr.toLowerCase();
   name = dev->getName().c_str();
   if (g_bleConnMode == BLE_MODE_SPARTAN_HUB) {
+    if (g_bleHubMac[0] != '\0' && macEquals(addr, g_bleHubMac)) return true;
     return name == SPARTAN_NAME ||
            addr == SPARTAN_MAC ||
-           macEquals(addr, g_bleTargetMac) ||
            dev->isAdvertisingService(NimBLEUUID(SPARTAN_SVC));
   }
   return macEquals(addr, g_bleTargetMac);
@@ -588,6 +644,7 @@ class SpartanScanCB : public NimBLEScanCallbacks {
     if (!bleScanMatchesTarget(dev, addr, name)) return;
     g_bleHubName = name.length() > 0 ? name :
                    (g_bleConnMode == BLE_MODE_SPARTAN_HUB ? SPARTAN_NAME : "123");
+    if (g_bleConnMode == BLE_MODE_SPARTAN_HUB) saveBleMacHub(addr.c_str());
     bleTarget    = dev->getAddress();
     bleDoConnect = true;
     NimBLEDevice::getScan()->stop();
@@ -612,28 +669,42 @@ static void bleStartScan() {
   if (g_bleConn || bleDoConnect || g_bleDiscoveryScan) return;
   auto* s = NimBLEDevice::getScan();
   s->setScanCallbacks(&spartanScanCB);
+  s->setMaxResults(0xFF);
   s->setActiveScan(g_bleConnMode == BLE_MODE_DIRECT_123);
   s->setInterval(160);
   s->setWindow(30);
-  s->start(g_bleConnMode == BLE_MODE_DIRECT_123 ? 10000 : 3000, false);
+  s->start(g_bleConnMode == BLE_MODE_DIRECT_123 ? 10000 : 3000, false, true);
   Serial.printf("BLE: Scan nach %s...\n", bleConnModeLabel());
 }
 
 static void bleStartDiscoveryScan() {
   if (!g_featureBle || g_bleDiscoveryScan) return;
-  if (bleClient && bleClient->isConnected()) bleClient->disconnect();
   bleDoConnect = false;
   g_bleConn = false;
   g_bleScanCount = 0;
-  g_bleDiscoveryScan = true;
   auto* s = NimBLEDevice::getScan();
+  if (bleClient && bleClient->isConnected()) {
+    bleClient->disconnect();
+    uint32_t until = millis() + 1000;
+    while (bleClient->isConnected() && millis() < until) {
+      delay(10);
+      yield();
+    }
+  }
   s->stop();
-  s->setScanCallbacks(&spartanScanCB);
+  bleWaitScanStopped(s, 500);
+  s->setScanCallbacks(&spartanScanCB, true);
   s->setActiveScan(true);
   s->setInterval(100);
   s->setWindow(99);
-  s->start(10000, false);
-  Serial.println("BLE: Discovery-Scan...");
+  s->setMaxResults(0);
+  g_bleDiscoveryScan = true;
+  if (!s->start(BLE_DISCOVERY_SCAN_MS, false, true)) {
+    g_bleDiscoveryScan = false;
+    Serial.println("BLE: Discovery-Scan Start FAIL");
+    return;
+  }
+  Serial.printf("BLE: Discovery-Scan %ums...\n", BLE_DISCOVERY_SCAN_MS);
 }
 
 static void bleConnect() {
@@ -842,8 +913,8 @@ static void drawLineFast(int x0, int y0, int x1, int y1, uint16_t color, int thi
 
 static void drawHand(float value, float maxValue, int length, int thickness, uint16_t color) {
   float angle = (value / maxValue) * 2.0f * PI - PI / 2.0f;
-  int x = 240 + (int)(cosf(angle) * length);
-  int y = 240 + (int)(sinf(angle) * length);
+  int x = 240 + (int)lroundf(cosf(angle) * (float)length);
+  int y = 240 + (int)lroundf(sinf(angle) * (float)length);
   drawLineFast(240, 240, x, y, color, thickness);
 }
 
@@ -951,43 +1022,129 @@ static void drawDialText(int cx, int cy, const char *text, uint16_t color, int s
   else drawTextCenteredRotated(cx, cy, text, color, scale, rotation);
 }
 
+// Pre-scaled dial in PSRAM: bilinear rebuild on setting change, fast memcpy each frame.
+static uint16_t *g_dialCache = nullptr;
+static int       g_dialCacheScale = -1;
+static int       g_dialCacheRot   = -1;
+static int       g_dialCacheOffX  = -999;
+static int       g_dialCacheOffY  = -999;
+
+static inline uint16_t lerpRgb565(uint16_t a, uint16_t b, uint8_t t) {
+  int ar = (a >> 11) & 0x1F, ag = (a >> 5) & 0x3F, ab = a & 0x1F;
+  int br = (b >> 11) & 0x1F, bg = (b >> 5) & 0x3F, bb = b & 0x1F;
+  int r = ar + ((br - ar) * t >> 8);
+  int g = ag + ((bg - ag) * t >> 8);
+  int bc = ab + ((bb - ab) * t >> 8);
+  return (uint16_t)((r << 11) | (g << 5) | bc);
+}
+
+static inline uint16_t bilinearRgb565(uint16_t c00, uint16_t c10, uint16_t c01, uint16_t c11,
+                                      uint8_t fx, uint8_t fy) {
+  return lerpRgb565(lerpRgb565(c00, c10, fx), lerpRgb565(c01, c11, fx), fy);
+}
+
+static void invalidateDialCache() {
+  g_dialCacheScale = -1;
+}
+
+static bool dialCacheMatches(int pct, int rot, int offX, int offY) {
+  return g_dialCache && g_dialCacheScale == pct && g_dialCacheRot == rot
+      && g_dialCacheOffX == offX && g_dialCacheOffY == offY;
+}
+
+static void rebuildDialCache(int pct, int rot, int offX, int offY) {
+  if (!g_dialCache) {
+    g_dialCache = (uint16_t*)ps_malloc(480 * 480 * sizeof(uint16_t));
+    if (!g_dialCache) {
+      Serial.println("dial cache: PSRAM alloc failed");
+      return;
+    }
+  }
+
+  const float cx = (float)DIAL_CENTER;
+  const float cy = (float)DIAL_CENTER;
+  const float invScale = 100.0f / (float)pct;
+  for (int i = 0; i < 480 * 480; i++) g_dialCache[i] = DIAL_FACE_BG;
+
+  for (int py = 0; py < 480; py++) {
+    for (int px = 0; px < 480; px++) {
+      float lx = (float)px - cx;
+      float ly = (float)py - cy;
+      float sx = cx + lx * invScale + (float)offX;
+      float sy = cy + ly * invScale + (float)offY;
+      if (rot != 0) {
+        float rx = sx - cx;
+        float ry = sy - cy;
+        sx = rx * g_rotCos - ry * g_rotSin + cx;
+        sy = rx * g_rotSin + ry * g_rotCos + cy;
+      }
+      if (sx < 0.0f || sy < 0.0f || sx > 479.0f || sy > 479.0f) continue;
+
+      int x0 = (int)sx;
+      int y0 = (int)sy;
+      int x1 = x0 + 1;
+      int y1 = y0 + 1;
+      if (x1 >= 480) x1 = 479;
+      if (y1 >= 480) y1 = 479;
+      uint8_t fx = (uint8_t)((sx - (float)x0) * 255.0f);
+      uint8_t fy = (uint8_t)((sy - (float)y0) * 255.0f);
+
+      uint16_t c00 = pgm_read_word(&VDO_DIAL_480_RGB565[y0 * 480 + x0]);
+      uint16_t c10 = pgm_read_word(&VDO_DIAL_480_RGB565[y0 * 480 + x1]);
+      uint16_t c01 = pgm_read_word(&VDO_DIAL_480_RGB565[y1 * 480 + x0]);
+      uint16_t c11 = pgm_read_word(&VDO_DIAL_480_RGB565[y1 * 480 + x1]);
+      g_dialCache[py * 480 + px] = bilinearRgb565(c00, c10, c01, c11, fx, fy);
+    }
+  }
+
+  g_dialCacheScale = pct;
+  g_dialCacheRot   = rot;
+  g_dialCacheOffX  = offX;
+  g_dialCacheOffY  = offY;
+}
+
 static void copyVdoDialToFrame() {
   uint16_t *fb = hal_fb();
   if (!fb) return;
   int pct = g_dialScalePct;
-  if (pct < 30) pct = 30;
-  if (pct > 100) pct = 100;
-  if (pct == 100 && g_rotationDeg == 0) {
+  if (pct < DIAL_SCALE_MIN) pct = DIAL_SCALE_MIN;
+  if (pct > DIAL_SCALE_MAX) pct = DIAL_SCALE_MAX;
+  if (pct == 100 && g_rotationDeg == 0 && g_dialCenterOffsetX == 0 && g_dialCenterOffsetY == 0) {
     for (int i = 0; i < 480 * 480; i++) fb[i] = pgm_read_word(&VDO_DIAL_480_RGB565[i]);
     return;
   }
-  for (int i = 0; i < 480 * 480; i++) fb[i] = RGB565_BLACK;
-  int outSize = (480 * pct) / 100;
-  int offset  = (480 - outSize) / 2;
-  if (g_rotationDeg == 0) {
-    for (int oy = 0; oy < outSize; oy++) {
-      int sy     = (oy * 480) / outSize;
-      int dstRow = (offset + oy) * 480 + offset;
-      int srcRow = sy * 480;
-      for (int ox = 0; ox < outSize; ox++) {
-        int sx = (ox * 480) / outSize;
-        fb[dstRow + ox] = pgm_read_word(&VDO_DIAL_480_RGB565[srcRow + sx]);
-      }
-    }
+
+  if (!dialCacheMatches(pct, g_rotationDeg, g_dialCenterOffsetX, g_dialCenterOffsetY)) {
+    rebuildDialCache(pct, g_rotationDeg, g_dialCenterOffsetX, g_dialCenterOffsetY);
+  }
+  if (g_dialCache) {
+    memcpy(fb, g_dialCache, 480 * 480 * sizeof(uint16_t));
     return;
   }
+
+  // Fallback if PSRAM cache unavailable: nearest-neighbor (legacy path).
+  const float cx = (float)DIAL_CENTER;
+  const float cy = (float)DIAL_CENTER;
+  const float offX = (float)g_dialCenterOffsetX;
+  const float offY = (float)g_dialCenterOffsetY;
+  const float invScale = 100.0f / (float)pct;
+  for (int i = 0; i < 480 * 480; i++) fb[i] = DIAL_FACE_BG;
   for (int py = 0; py < 480; py++) {
     for (int px = 0; px < 480; px++) {
-      float dx = (float)px - 239.5f;
-      float dy = (float)py - 239.5f;
-      int lx = (int)lroundf(dx * g_rotCos + dy * g_rotSin + 239.5f);
-      int ly = (int)lroundf(-dx * g_rotSin + dy * g_rotCos + 239.5f);
-      int ox = lx - offset;
-      int oy = ly - offset;
-      if ((unsigned)ox < (unsigned)outSize && (unsigned)oy < (unsigned)outSize) {
-        int sx = (ox * 480) / outSize;
-        int sy = (oy * 480) / outSize;
-        fb[py * 480 + px] = pgm_read_word(&VDO_DIAL_480_RGB565[sy * 480 + sx]);
+      float lx = (float)px - cx;
+      float ly = (float)py - cy;
+      float sx = cx + lx * invScale + offX;
+      float sy = cy + ly * invScale + offY;
+      if (g_rotationDeg != 0) {
+        float rx = sx - cx;
+        float ry = sy - cy;
+        sx = rx * g_rotCos - ry * g_rotSin + cx;
+        sy = rx * g_rotSin + ry * g_rotCos + cy;
+      }
+      int ix = (int)lroundf(sx);
+      int iy = (int)lroundf(sy);
+      if ((unsigned)ix < 480u && (unsigned)iy < 480u) {
+        fb[py * 480 + px] = pgm_read_word(&VDO_DIAL_480_RGB565[iy * 480 + ix]);
       }
     }
   }
@@ -1003,7 +1160,7 @@ static void drawVdoClock() {
   float hourValue   = (now.tm_hour % 12) + minuteValue / 60.0f;
   float s = g_dialScalePct / 100.0f;
   if (s < 0.30f) s = 0.30f;
-  if (s > 1.0f)  s = 1.0f;
+  if (s > 1.20f) s = 1.20f;
   #define SC(v) ((int)((v) * s + 0.5f))
   drawHand(hourValue,   12.0f, SC(118), SC(18), RGB565(24,  24,  22));
   drawHand(hourValue,   12.0f, SC(118), SC(13), RGB565(222, 222, 214));
@@ -1123,8 +1280,7 @@ static void drawHubPage() {
   drawTextCentered(240, 54, "BLE", RGB565(205, 120, 230), 5);
   drawTextCentered(240, 84, bleConnModeLabel(), RGB565(150, 150, 150), 2);
   char buf[24];
-  drawDataRow(112, "ZIEL",  g_bleConnMode == BLE_MODE_SPARTAN_HUB ? g_bleHubName.c_str() : g_bleTargetMac,
-              RGB565(235, 235, 225));
+  drawDataRow(112, "ZIEL",  bleTargetDisplay(), RGB565(235, 235, 225));
   drawDataRow(148, "BLE",   g_bleConn ? "OK" : "SCAN",
               g_bleConn ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
   snprintf(buf, sizeof(buf), "%lu", (unsigned long)g_bleRxCnt);
@@ -1165,7 +1321,9 @@ static void drawSetupPage() {
               g_featureBuzzer ? RGB565(60, 210, 100) : RGB565(150, 150, 150));
   drawDataRow(326, "QUELLE", bleConnModeLabel(),
               g_bleConnMode == BLE_MODE_SPARTAN_HUB ? RGB565(80, 160, 240) : RGB565(235, 150, 60));
-  drawTextCentered(240, 372, "TIP MENU", RGB565(180, 180, 170), 2);
+  drawDataRow(362, "IMU NULL", g_imuTrimmed ? "SET" : "TAP",
+              g_imuTrimmed ? RGB565(60, 210, 100) : RGB565(220, 130, 50));
+  drawTextCentered(240, 396, "TIP MENU", RGB565(180, 180, 170), 2);
   presentFrame();
 }
 
@@ -1174,6 +1332,9 @@ static void drawImuPage() {
   fillFrame(RGB565_BLACK);
   drawCircleLine(240, 240, 216, 3, RGB565(200, 100, 50));
   drawTextCentered(240, 52, "IMU", RGB565(220, 130, 60), 5);
+  if (g_imuTrimmed) {
+    drawTextCentered(240, 78, "NULL", RGB565(60, 200, 90), 2);
+  }
 
   char buf[16];
   if (g_imuPresent) {
@@ -1215,7 +1376,9 @@ static void drawCurrentPage() {
 static void loadSettings() {
   Preferences p;
   p.begin("clock", true);
-  g_dialScalePct  = p.getInt("scale",     100);
+  g_dialScalePct       = p.getInt("scale",     DIAL_SCALE_DEFAULT);
+  g_dialCenterOffsetX  = p.getInt("dial_off_x", DIAL_CENTER_OFF_X_DEFAULT);
+  g_dialCenterOffsetY  = p.getInt("dial_off_y", DIAL_CENTER_OFF_Y_DEFAULT);
   g_brightnessPct = p.getInt("bright",    100);
   g_rotationDeg   = p.getInt("rot_deg",   0);
   g_wifiProfile   = p.getUChar("wifi_prof", 0);
@@ -1225,12 +1388,22 @@ static void loadSettings() {
   g_featureBuzzer = p.getBool("feat_buzzer", false);  // default OFF
   g_bleConnMode   = p.getUChar("ble_mode", BLE_MODE_SPARTAN_HUB) == BLE_MODE_DIRECT_123 ?
                     BLE_MODE_DIRECT_123 : BLE_MODE_SPARTAN_HUB;
-  String mac = p.getString("ble_mac", DEFAULT_123_MAC);
-  strncpy(g_bleTargetMac, mac.c_str(), sizeof(g_bleTargetMac) - 1);
+  String mac123 = p.getString("ble_mac_123", "");
+  if (mac123.length() == 0) mac123 = p.getString("ble_mac", DEFAULT_123_MAC);
+  strncpy(g_bleTargetMac, mac123.c_str(), sizeof(g_bleTargetMac) - 1);
   g_bleTargetMac[sizeof(g_bleTargetMac) - 1] = 0;
+  String macHub = p.getString("ble_mac_hub", "");
+  strncpy(g_bleHubMac, macHub.c_str(), sizeof(g_bleHubMac) - 1);
+  g_bleHubMac[sizeof(g_bleHubMac) - 1] = 0;
+  qmi8658SetTrim(p.getFloat("imu_off_p", 0.0f), p.getFloat("imu_off_r", 0.0f),
+                 p.getBool("imu_trim", false));
   p.end();
-  if (g_dialScalePct  < 30)  g_dialScalePct  = 30;
-  if (g_dialScalePct  > 100) g_dialScalePct  = 100;
+  if (g_dialScalePct  < DIAL_SCALE_MIN) g_dialScalePct  = DIAL_SCALE_MIN;
+  if (g_dialScalePct  > DIAL_SCALE_MAX) g_dialScalePct  = DIAL_SCALE_MAX;
+  if (g_dialCenterOffsetX < -20) g_dialCenterOffsetX = -20;
+  if (g_dialCenterOffsetX >  20) g_dialCenterOffsetX =  20;
+  if (g_dialCenterOffsetY < -20) g_dialCenterOffsetY = -20;
+  if (g_dialCenterOffsetY >  20) g_dialCenterOffsetY =  20;
   if (g_brightnessPct < 5)   g_brightnessPct = 5;
   if (g_brightnessPct > 100) g_brightnessPct = 100;
   g_rotationDeg %= 360;
@@ -1239,9 +1412,10 @@ static void loadSettings() {
 }
 
 static void saveDialScale(int pct) {
-  if (pct < 30)  pct = 30;
-  if (pct > 100) pct = 100;
+  if (pct < DIAL_SCALE_MIN) pct = DIAL_SCALE_MIN;
+  if (pct > DIAL_SCALE_MAX) pct = DIAL_SCALE_MAX;
   g_dialScalePct = pct;
+  invalidateDialCache();
   Preferences p;
   p.begin("clock", false);
   p.putInt("scale", pct);
@@ -1269,10 +1443,28 @@ static void updateRotationCache() {
 static void saveRotation(int deg) {
   g_rotationDeg = deg;
   updateRotationCache();
+  invalidateDialCache();
   Preferences p;
   p.begin("clock", false);
   p.putInt("rot_deg", g_rotationDeg);
   p.end();
+}
+
+static void saveImuTrim() {
+  Preferences p;
+  p.begin("clock", false);
+  p.putFloat("imu_off_p", g_imuOffPitch);
+  p.putFloat("imu_off_r", g_imuOffRoll);
+  p.putBool("imu_trim", g_imuTrimmed);
+  p.end();
+}
+
+static bool calibrateImuZero() {
+  if (!g_imuPresent) return false;
+  if (!qmi8658Zero()) return false;
+  saveImuTrim();
+  Serial.printf("IMU: NULL gesetzt P=%.1f R=%.1f\n", g_imuOffPitch, g_imuOffRoll);
+  return true;
 }
 
 static void saveFeatures(bool wifi, bool ble, bool buzzer) {
@@ -1489,6 +1681,9 @@ static void webAppendPageMockSvg(String& svg, uint8_t page) {
   } else if (page == 6) {
     if (g_imuPresent) {
       char line[24];
+      if (g_imuTrimmed) {
+        svg += F("<text x='120' y='98' text-anchor='middle' fill='#54d273' font-size='8' font-family='system-ui,sans-serif'>NULL</text>");
+      }
       snprintf(line, sizeof(line), "P %.1f", g_imuPitch);
       svg += F("<text x='120' y='118' text-anchor='middle' fill='#eee' font-size='11' class='pv-imu-p' font-family='system-ui,sans-serif'>");
       svg += line;
@@ -1609,7 +1804,7 @@ static void handleWebRoot() {
             "<a href='/page?p=0'><button>Uhr</button></a><a href='/page?p=1'><button>Menu</button></a><a href='/page?p=2'><button>Motor</button></a><a href='/page?p=3'><button>Lambda</button></a><a href='/page?p=4'><button>Hub</button></a><a href='/page?p=6'><button>IMU</button></a><a href='/page?p=5'><button>Setup</button></a></div></div>"
             "<div class='card'><h3>Zifferblatt-Groesse</h3><form action='/set' method='get'><div class='row'><b><span id='scaleVal'>");
   html += String(g_dialScalePct);
-  html += F("</span>%</b><button type='submit'>Uebernehmen</button></div><input type='range' name='scale' min='30' max='100' step='1' value='");
+  html += F("</span>%</b><button type='submit'>Uebernehmen</button></div><input type='range' name='scale' min='30' max='120' step='1' value='");
   html += String(g_dialScalePct);
   html += F("' oninput=\"scaleVal.innerText=this.value\"></form><div class='row'><span><a href='/set?scale_delta=-5'><button>-5%</button></a><a href='/set?scale_delta=-1'><button>-1%</button></a><a href='/set?scale_delta=1'><button>+1%</button></a><a href='/set?scale_delta=5'><button>+5%</button></a></span></div></div><div class='card'><h3>Rotation</h3><div class='row'><b>");
   html += String(g_rotationDeg);
@@ -1632,8 +1827,8 @@ static void handleWebRoot() {
   html += F(">Spartan Hub</button></a><a href='/ble/mode?m=direct'><button");
   if (g_bleConnMode == BLE_MODE_DIRECT_123) html += F(" style='background:#54d273'");
   html += F(">123 direkt</button></a></span></div><p class='sub'>Ziel-MAC: <span id='bleMacLabel'>");
-  html += String(g_bleTargetMac);
-  html += F("</span></p><button onclick='scanBle()'>&#128269; BLE Scan</button><table><thead><tr><th>Name</th><th>MAC</th><th>RSSI</th><th></th></tr></thead><tbody id='bleScanRows'><tr><td colspan='4'>Noch kein Scan</td></tr></tbody></table></div>"
+  html += String(bleTargetDisplay());
+  html += F("</span></p><button onclick='scanBle()'>&#128269; BLE Scan</button><table><thead><tr><th>Name</th><th>MAC</th><th>RSSI</th><th>Typ</th><th></th></tr></thead><tbody id='bleScanRows'><tr><td colspan='5'>Noch kein Scan</td></tr></tbody></table></div>"
             "<div class='card'><h2>OTA Firmware</h2><p class='sub'>Kaputte Updates rollen automatisch zur vorherigen Firmware zurueck. PC-Backup: backups/esp32s3_vdo_backup_2026-06-10.bin (esptool).</p>"
             "<form id='otaForm' method='POST' action='/update' enctype='multipart/form-data'><input class='file' type='file' name='update' accept='.bin,application/octet-stream' required><button type='submit' id='otaBtn'>Firmware hochladen</button>"
             "<div class='ota-progress' id='otaProgress' hidden><div class='ota-track'><div class='ota-bar' id='otaBar'></div></div><p id='otaStatus' class='sub'>Upload laeuft...</p></div></form></div>"
@@ -1674,7 +1869,9 @@ static void handleWebRoot() {
             "if(d.page!==lastPreviewPage){lastPreviewPage=d.page;refreshPreview().then(()=>syncPreviewValues(d));}"
             "else syncPreviewValues(d);}"
             "async function scanWifi(){const rows=document.getElementById('scanRows');rows.innerHTML='<tr><td colspan=3>Scan laeuft...</td></tr>';try{const r=await fetch('/scan');const d=await r.json();rows.innerHTML=d.networks.map(n=>`<tr><td>${n.ssid}</td><td>${n.rssi}</td><td>${n.connected?'verbunden':''}</td></tr>`).join('')||'<tr><td colspan=3>Keine Netze</td></tr>';}catch(e){rows.innerHTML='<tr><td colspan=3>Scan fehlgeschlagen</td></tr>';}}"
-            "async function scanBle(){const rows=document.getElementById('bleScanRows');rows.innerHTML='<tr><td colspan=4>Scan laeuft...</td></tr>';try{const r=await fetch('/ble/scan');const d=await r.json();rows.innerHTML=d.devices.map(n=>`<tr><td>${n.name}</td><td>${n.mac}</td><td>${n.rssi}</td><td><a href='/ble/select?mac=${encodeURIComponent(n.mac)}'><button>Waehlen</button></a></td></tr>`).join('')||'<tr><td colspan=4>Keine Geraete</td></tr>';}catch(e){rows.innerHTML='<tr><td colspan=4>Scan fehlgeschlagen</td></tr>';}}"
+            "async function scanBle(){const rows=document.getElementById('bleScanRows');rows.innerHTML='<tr><td colspan=5>Scan laeuft...</td></tr>';try{const r=await fetch('/ble/scan');const d=await r.json();if(d.error){rows.innerHTML='<tr><td colspan=5>BLE aus – Setup: BLE aktivieren</td></tr>';return;}"
+            "const typ=n=>[n.spartan?'Hub':'',n.nus?'NUS':''].filter(Boolean).join(',')||'–';"
+            "rows.innerHTML=d.devices.map(n=>`<tr><td>${n.name}</td><td>${n.mac}</td><td>${n.rssi}</td><td>${typ(n)}</td><td><a href='/ble/select?mac=${encodeURIComponent(n.mac)}'><button>Waehlen</button></a></td></tr>`).join('')||'<tr><td colspan=5>Keine Geraete</td></tr>';}catch(e){rows.innerHTML='<tr><td colspan=5>Scan fehlgeschlagen</td></tr>';}}"
             "function syncBleSetup(d){const m=document.getElementById('bleModeLabel');if(m)m.textContent=d.ble_mode_label||'?';const mac=document.getElementById('bleMacLabel');if(mac)mac.textContent=d.ble_target_mac||'---';}"
             "async function live(){try{const r=await fetch('/api/status');const d=await r.json();document.getElementById('liveBox').textContent=JSON.stringify(d,null,2);syncDashboard(d);}catch(e){document.getElementById('liveBox').textContent='Live-Status nicht erreichbar';}}"
             "const otaForm=document.getElementById('otaForm');"
@@ -1700,7 +1897,7 @@ static void handleWebBleScan() {
     return;
   }
   bleStartDiscoveryScan();
-  uint32_t waitUntil = millis() + 11000;
+  uint32_t waitUntil = millis() + BLE_DISCOVERY_SCAN_MS + 1500;
   while (g_bleDiscoveryScan && millis() < waitUntil) {
     webServer.handleClient();
     delay(10);
@@ -1746,10 +1943,11 @@ static void handleWebBleSelect() {
       }
     }
   }
-  saveBleTargetMac(mac.c_str());
+  if (mode == BLE_MODE_SPARTAN_HUB) saveBleMacHub(mac.c_str());
+  else saveBleMac123(mac.c_str());
   saveBleConnMode(mode);
   disconnectBleForModeChange();
-  Serial.printf("Web: BLE Ziel -> %s (%s)\n", g_bleTargetMac, bleConnModeLabel());
+  Serial.printf("Web: BLE Ziel -> %s (%s)\n", bleTargetDisplay(), bleConnModeLabel());
   webServer.sendHeader("Location", "/");
   webServer.send(303);
 }
@@ -1832,7 +2030,11 @@ static void handleWebStatus() {
   json += F("\",\"ble_mode_label\":\"");
   json += bleConnModeLabel();
   json += F("\",\"ble_target_mac\":\"");
+  json += jsonEscape(String(bleTargetDisplay()));
+  json += F("\",\"ble_mac_123\":\"");
   json += jsonEscape(String(g_bleTargetMac));
+  json += F("\",\"ble_mac_hub\":\"");
+  json += jsonEscape(String(g_bleHubMac));
   json += F("\",\"ble_target_name\":\"");
   json += jsonEscape(g_bleHubName);
   json += F("\",\"page\":");
@@ -1849,6 +2051,8 @@ static void handleWebStatus() {
   json += String(g_imuPitch, 1);
   json += F(",\"imu_roll\":");
   json += String(g_imuRoll, 1);
+  json += F(",\"imu_trimmed\":");
+  json += g_imuTrimmed ? F("true") : F("false");
   json += F(",\"ota_boot\":\"");
   json += g_otaBootLabel;
   json += F("\"}");
@@ -1876,6 +2080,12 @@ static void handleWebRestart() {
   webServer.send(200, "text/html", F("<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Restart</title></head><body><h1>ESP32 startet neu...</h1></body></html>"));
   delay(500);
   ESP.restart();
+}
+
+static void handleWebImuZero() {
+  if (calibrateImuZero()) g_redrawPage = true;
+  webServer.sendHeader("Location", "/");
+  webServer.send(303);
 }
 
 static void handleWebSet() {
@@ -1958,6 +2168,7 @@ static void startWebServer() {
   webServer.on("/api/ota/progress", HTTP_GET, handleWebOtaProgress);
   webServer.on("/api/preview", HTTP_GET, handleWebPreview);
   webServer.on("/restart", HTTP_GET, handleWebRestart);
+  webServer.on("/imu/zero", HTTP_GET, handleWebImuZero);
   webServer.on("/update", HTTP_POST, []() {
     const bool ok = !Update.hasError() && Update.remaining() == 0;
     webServer.sendHeader("Connection", "close");
@@ -2010,7 +2221,7 @@ static void handleSetupLongPress(uint16_t y, uint32_t durMs) {
   Serial.printf("setup long-press y=%u dur=%lu\n", y, (unsigned long)durMs);
 
   // Zonen passend zu drawSetupPage (Zeilen-Mitte = Zonenstart + 18, Hoehe 36)
-  if (y >= 345) {                       // unten -> zurueck ins Menue
+  if (y >= 380) {                       // unten -> zurueck ins Menue
     currentPage = 1;
     drawMenuOverview();
     Serial.println("setup tap: menu");
@@ -2018,7 +2229,7 @@ static void handleSetupLongPress(uint16_t y, uint32_t durMs) {
   }
 
   if (y >= 92 && y < 128) {             // UHR (Zeile 110)
-    int next = (g_dialScalePct < 85) ? 90 : (g_dialScalePct < 95 ? 100 : 80);
+    int next = (g_dialScalePct < 115) ? 115 : (g_dialScalePct < 120 ? 120 : 115);
     saveDialScale(next);
     drawSetupPage();
     Serial.printf("setup tap: dial=%d%%\n", g_dialScalePct);
@@ -2048,6 +2259,9 @@ static void handleSetupLongPress(uint16_t y, uint32_t durMs) {
     cycleBleConnMode();
     drawSetupPage();
     Serial.printf("setup tap: ble_source=%s\n", bleConnModeLabel());
+  } else if (y >= 344 && y < 380) {     // IMU NULL (Zeile 362)
+    if (calibrateImuZero()) drawSetupPage();
+    Serial.println("setup tap: imu_null");
   } else {
     drawSetupPage();
     Serial.println("setup tap: no action");
@@ -2138,6 +2352,13 @@ void setup() {
 
   initTimeSource();
   hal_backlight(true);
+  if (g_dialScalePct != 100 || g_rotationDeg != 0 || g_dialCenterOffsetX != 0 || g_dialCenterOffsetY != 0) {
+    int pct = g_dialScalePct;
+    if (pct < DIAL_SCALE_MIN) pct = DIAL_SCALE_MIN;
+    if (pct > DIAL_SCALE_MAX) pct = DIAL_SCALE_MAX;
+    rebuildDialCache(pct, g_rotationDeg, g_dialCenterOffsetX, g_dialCenterOffsetY);
+    Serial.printf("Dial cache: %s (%d%%, rot=%d)\n", g_dialCache ? "ready" : "fallback", pct, g_rotationDeg);
+  }
   drawVdoClock();
   otaConfirmBootIfPending();
   Serial.println("VDO clock drawn.");
@@ -2255,7 +2476,8 @@ void loop() {
           saveBleConnMode(BLE_MODE_DIRECT_123); disconnectBleForModeChange(); g_redrawPage = true;
         }
         else if (cmd == "ble:scan") { bleStartDiscoveryScan(); }
-        else { Serial.println("Commands: ble:on|off|hub|123|scan | buzzer:on|off | wifi:next|off | rot:+|-|NN | clock"); }
+        else if (cmd == "imu:zero") { if (calibrateImuZero()) g_redrawPage = true; }
+        else { Serial.println("Commands: ble:on|off|hub|123|scan | buzzer:on|off | wifi:next|off | rot:+|-|NN | imu:zero | clock"); }
       }
     } else if (serialLine.length() < 64) {
       serialLine += c;
