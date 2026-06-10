@@ -2096,6 +2096,7 @@ void setup() {
   Serial.printf("PSRAM found: %s, size: %u bytes\n", psramFound() ? "yes" : "no", ESP.getPsramSize());
 
   // Backlight diagnostic blink (2x 50ms) before panel init.
+  // Später: ADC-Dimming vom Original-Tacho-Drehregler — siehe FUTURE.md
   hal_backlight(true);  delay(50);
   hal_backlight(false); delay(50);
   hal_backlight(true);  delay(50);
