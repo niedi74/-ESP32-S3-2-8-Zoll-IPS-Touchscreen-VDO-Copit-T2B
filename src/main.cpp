@@ -8,6 +8,8 @@
 #include <WebServer.h>
 #include <Update.h>
 #include <NimBLEDevice.h>
+#include "esp_task_wdt.h"
+#include "esp_ota_ops.h"
 #if __has_include("wifi_secret.h")
   #include "wifi_secret.h"
 #else
@@ -81,12 +83,122 @@ static bool      g_featureBle   = false;
 static bool      g_featureBuzzer = false;  // default OFF, per Setup/Web schaltbar
 static bool      g_webStarted   = false;
 static bool      g_redrawPage   = false;
+static volatile bool g_otaBusy  = false;
+static volatile size_t g_otaRxBytes = 0;
+static const char* g_otaBootLabel = "normal";
 static uint8_t   g_wifiProfile  = 0;
 static WebServer webServer(80);
 static void startWebServer();   // forward declaration
 static void reconnectWifiProfile();
 static void cycleWifiProfile();
 static void updateRotationCache();
+
+static void webOtaAbortUpload();
+
+static void otaNoteBootState() {
+  const esp_partition_t* part = esp_ota_get_running_partition();
+  if (!part) return;
+  esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
+  if (esp_ota_get_state_partition(part, &state) != ESP_OK) return;
+
+  if (state == ESP_OTA_IMG_PENDING_VERIFY) {
+    g_otaBootLabel = "pending";
+    Serial.println("OTA: neue Firmware wartet auf Self-Test");
+  } else if (state == ESP_OTA_IMG_INVALID || state == ESP_OTA_IMG_ABORTED) {
+    g_otaBootLabel = "rollback";
+    Serial.println("OTA: Rollback-Boot erkannt");
+  }
+}
+
+static void otaValidatePendingBoot() {
+  const esp_partition_t* part = esp_ota_get_running_partition();
+  if (!part) return;
+  esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
+  if (esp_ota_get_state_partition(part, &state) != ESP_OK) return;
+  if (state != ESP_OTA_IMG_PENDING_VERIFY) return;
+  if (!hal_ok()) {
+    Serial.println("OTA: Display/HAL fehlgeschlagen -> Rollback");
+    esp_ota_mark_app_invalid_rollback_and_reboot();
+  }
+}
+
+static void otaConfirmBootIfPending() {
+  const esp_partition_t* part = esp_ota_get_running_partition();
+  if (!part) return;
+  esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
+  if (esp_ota_get_state_partition(part, &state) != ESP_OK) return;
+  if (state != ESP_OTA_IMG_PENDING_VERIFY) return;
+  if (esp_ota_mark_app_valid_cancel_rollback() == ESP_OK) {
+    g_otaBootLabel = "valid";
+    Serial.println("OTA: Firmware bestaetigt (Rollback aus)");
+  }
+}
+
+static bool webOtaRejectBusy() {
+  if (!g_otaBusy) return false;
+  webServer.sendHeader("Connection", "close");
+  webServer.send(503, "text/plain", "OTA busy");
+  return true;
+}
+
+static void webOtaBeginUpload(const char* filename) {
+  g_otaBusy = true;
+  g_otaRxBytes = 0;
+  hal_pause_for_ota(true);
+  WiFi.setSleep(WIFI_PS_NONE);
+  if (g_featureBle) {
+    NimBLEDevice::getScan()->stop();
+    if (bleClient && bleClient->isConnected()) bleClient->disconnect();
+  }
+  webServer.client().setNoDelay(true);
+  webServer.client().setTimeout(300);
+  Serial.printf("OTA: Start %s (heap %u, sketch free %u)\n",
+                filename ? filename : "?", ESP.getFreeHeap(), ESP.getFreeSketchSpace());
+  if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) {
+    Update.printError(Serial);
+    g_otaBusy = false;
+    hal_pause_for_ota(false);
+  }
+}
+
+static void webOtaWriteChunk(uint8_t* data, size_t len) {
+  if (!g_otaBusy || !data || len == 0) return;
+  g_otaRxBytes += len;
+  if (Update.write(data, len) != len) {
+    Update.printError(Serial);
+    Update.abort();
+    g_otaBusy = false;
+    hal_pause_for_ota(false);
+    return;
+  }
+  static uint32_t lastLog = 0;
+  const size_t done = Update.progress();
+  if (millis() - lastLog >= 2000 || (done % 131072) < len) {
+    Serial.printf("OTA: %u bytes\n", (unsigned)done);
+    lastLog = millis();
+  }
+  yield();
+  delay(1);
+  esp_task_wdt_reset();
+}
+
+static void webOtaFinishUpload(size_t totalSize) {
+  if (!g_otaBusy) return;
+  if (Update.end(true)) {
+    Serial.printf("OTA: Erfolg, %u Bytes\n", (unsigned)totalSize);
+  } else {
+    Update.printError(Serial);
+    g_otaBusy = false;
+    hal_pause_for_ota(false);
+  }
+}
+
+static void webOtaAbortUpload() {
+  Update.abort();
+  g_otaBusy = false;
+  hal_pause_for_ota(false);
+  Serial.println("OTA: abgebrochen");
+}
 
 struct WifiProfile {
   const char* ssid;
@@ -1030,14 +1142,223 @@ static String jsonEscape(const String& value) {
   return out;
 }
 
+static const char* webPageLabel(uint8_t page) {
+  switch (page) {
+    case 0: return "UHR";
+    case 1: return "MENU";
+    case 2: return "MOTOR";
+    case 3: return "LAMBDA";
+    case 4: return "HUB";
+    case 5: return "SETUP";
+    case 6: return "IMU";
+    default: return "???";
+  }
+}
+
+static const char* webPageAccent(uint8_t page) {
+  switch (page) {
+    case 2: return "#2896d2";
+    case 3: return "#3cb95a";
+    case 4: return "#be5ad2";
+    case 5: return "#d2bc2d";
+    case 6: return "#c86432";
+    default: return "#505050";
+  }
+}
+
+static void webAppendVdoHands(String& svg, const struct tm* now) {
+  const float secVal  = (float)now->tm_sec;
+  const float minVal  = (float)now->tm_min + secVal / 60.0f;
+  const float hourVal = (float)(now->tm_hour % 12) + minVal / 60.0f;
+  char hDeg[12], mDeg[12], sDeg[12];
+  snprintf(hDeg, sizeof(hDeg), "%.2f", hourVal * 30.0f);
+  snprintf(mDeg, sizeof(mDeg), "%.2f", minVal * 6.0f);
+  snprintf(sDeg, sizeof(sDeg), "%.2f", secVal * 6.0f);
+
+  svg += F("<g class='preview-hands' transform='translate(120 120)'>"
+           "<g class='hand-h' transform='rotate(");
+  svg += hDeg;
+  svg += F(")'><rect x='-5' y='-30' width='10' height='30' rx='3' fill='#181816'/>"
+           "<rect x='-4' y='-30' width='8' height='30' rx='3' fill='#deded6'/></g>"
+           "<g class='hand-m' transform='rotate(");
+  svg += mDeg;
+  svg += F(")'><rect x='-4' y='-43' width='8' height='43' rx='2' fill='#181816'/>"
+           "<rect x='-3' y='-43' width='6' height='43' rx='2' fill='#e2e2da'/></g>"
+           "<g class='hand-s' transform='rotate(");
+  svg += sDeg;
+  svg += F(")'><line x1='0' y1='10' x2='0' y2='-47' stroke='#eb1814' stroke-width='2.5' stroke-linecap='round'/></g>"
+           "<circle r='13' fill='#cdcbc2'/><circle r='8' fill='#a67a2a'/><circle r='5' fill='#261e12'/></g>");
+}
+
+static void webAppendClockSvg(String& svg, const struct tm* now) {
+  svg += F("<svg class='preview-svg' viewBox='0 0 240 240' aria-label='VDO Uhr'>"
+           "<defs><radialGradient id='vdoFace' cx='50%' cy='42%' r='58%'>"
+           "<stop offset='0%' stop-color='#141210'/><stop offset='55%' stop-color='#070707'/><stop offset='100%' stop-color='#020202'/></radialGradient></defs>"
+           "<circle cx='120' cy='120' r='112' fill='#0a0a0a' stroke='#3a3a3a' stroke-width='3'/>"
+           "<circle cx='120' cy='120' r='104' fill='url(#vdoFace)' stroke='#d8d0bc' stroke-width='2'/>"
+           "<g stroke='#8f8878' stroke-linecap='round'>");
+  for (int i = 0; i < 60; i++) {
+    const bool major = (i % 5) == 0;
+    const float rad = (float)i * PI / 30.0f;
+    const float r0  = major ? 86.0f : 91.0f;
+    const float r1  = 98.0f;
+    char tick[96];
+    snprintf(tick, sizeof(tick),
+             "<line x1='%.1f' y1='%.1f' x2='%.1f' y2='%.1f' stroke-width='%d'/>",
+             120.0f + sinf(rad) * r0, 120.0f - cosf(rad) * r0,
+             120.0f + sinf(rad) * r1, 120.0f - cosf(rad) * r1,
+             major ? 2 : 1);
+    svg += tick;
+  }
+  svg += F("</g><g fill='#ddd8cc' font-family='Georgia,Times New Roman,serif' font-weight='700' text-anchor='middle'>");
+  for (int n = 1; n <= 12; n++) {
+    const float rad = (float)n * PI / 6.0f;
+    char num[64];
+    snprintf(num, sizeof(num),
+             "<text x='%.1f' y='%.1f' font-size='15'>%d</text>",
+             120.0f + sinf(rad) * 72.0f, 120.0f - cosf(rad) * 72.0f + 5.0f, n);
+    svg += num;
+  }
+  svg += F("</g><text x='120' y='58' text-anchor='middle' fill='#c8c0aa' font-family='Georgia,serif' font-size='13' letter-spacing='2'>VDO</text>"
+           "<text x='120' y='152' text-anchor='middle' fill='#8a8474' font-family='system-ui,sans-serif' font-size='8' letter-spacing='1.5'>QUARTZ-ZEIT</text>");
+  webAppendVdoHands(svg, now);
+  svg += F("</svg>");
+}
+
+static void webAppendPageMockSvg(String& svg, uint8_t page) {
+  svg += F("<svg class='preview-svg' viewBox='0 0 240 240' aria-label='Display Seite'>"
+           "<circle cx='120' cy='120' r='112' fill='#050505' stroke='#333' stroke-width='3'/>"
+           "<circle cx='120' cy='120' r='104' fill='#080808' stroke='");
+  svg += webPageAccent(page);
+  svg += F("' stroke-width='3'/><text x='120' y='58' text-anchor='middle' fill='");
+  svg += webPageAccent(page);
+  svg += F("' font-family='system-ui,sans-serif' font-size='18' font-weight='700'>");
+  svg += webPageLabel(page);
+  svg += F("</text>");
+
+  if (page == 1) {
+    const char* items[] = {"UHR", "MOTOR", "LAMBDA", "HUB", "IMU", "SETUP"};
+    const char* cols[] = {"#c82823", "#2896d2", "#3cb95a", "#be5ad2", "#c86432", "#d2bc2d"};
+    for (int i = 0; i < 6; i++) {
+      char row[128];
+      snprintf(row, sizeof(row),
+               "<rect x='44' y='%d' width='152' height='18' rx='3' fill='#121212' stroke='#333'/>"
+               "<rect x='44' y='%d' width='6' height='18' fill='%s'/>"
+               "<text x='58' y='%d' fill='#ddd' font-family='system-ui,sans-serif' font-size='9'>%s</text>",
+               78 + i * 22, 78 + i * 22, cols[i], 91 + i * 22, items[i]);
+      svg += row;
+    }
+  } else if (page == 2) {
+    const bool fresh = bleFresh();
+    char line[32];
+    svg += F("<text x='52' y='108' fill='#888' font-size='9' font-family='system-ui,sans-serif'>RPM</text>"
+             "<text x='188' y='108' text-anchor='end' fill='#eee' font-size='10' class='pv-rpm' font-family='system-ui,sans-serif'>");
+    snprintf(line, sizeof(line), "%d", fresh ? (int)g_rpm : 0);
+    svg += line;
+    svg += F("</text><text x='52' y='128' fill='#888' font-size='9' font-family='system-ui,sans-serif'>ADV</text>"
+             "<text x='188' y='128' text-anchor='end' fill='#eee' font-size='10' class='pv-adv' font-family='system-ui,sans-serif'>");
+    snprintf(line, sizeof(line), "%.0f", fresh ? g_adv : 0.0f);
+    svg += line;
+    svg += F("</text><text x='52' y='148' fill='#888' font-size='9' font-family='system-ui,sans-serif'>MAP</text>"
+             "<text x='188' y='148' text-anchor='end' fill='#eee' font-size='10' class='pv-map' font-family='system-ui,sans-serif'>");
+    snprintf(line, sizeof(line), "%d", fresh ? (int)g_map : 0);
+    svg += line;
+    svg += F("</text><text x='52' y='168' fill='#888' font-size='9' font-family='system-ui,sans-serif'>BATT</text>"
+             "<text x='188' y='168' text-anchor='end' fill='#eee' font-size='10' class='pv-batt' font-family='system-ui,sans-serif'>");
+    if (fresh && g_battValid) snprintf(line, sizeof(line), "%.1fV", g_battVolt);
+    else strcpy(line, "---");
+    svg += line;
+    svg += F("</text><text x='120' y='192' text-anchor='middle' fill='#888' font-size='9' class='pv-motor-st' font-family='system-ui,sans-serif'>");
+    svg += fresh ? (g_bleConn ? F("LIVE") : F("WARTE")) : F("---");
+    svg += F("</text>");
+  } else if (page == 3) {
+    char line[24];
+    if (g_lambdaValid) snprintf(line, sizeof(line), "%.2f", g_lambda);
+    else strcpy(line, "----");
+    svg += F("<text x='120' y='132' text-anchor='middle' fill='#46d06a' font-size='28' font-family='system-ui,sans-serif' font-weight='700' class='pv-lambda'>");
+    svg += line;
+    svg += F("</text>");
+  } else if (page == 4) {
+    svg += F("<text x='120' y='118' text-anchor='middle' fill='#");
+    svg += g_bleConn ? F("54d273") : F("e7a944");
+    svg += F("' font-size='14' font-family='system-ui,sans-serif' class='pv-hub-st'>");
+    svg += g_bleConn ? F("HUB OK") : F("KEIN HUB");
+    svg += F("</text><text x='120' y='142' text-anchor='middle' fill='#aaa' font-size='10' font-family='system-ui,sans-serif'>RX <tspan class='pv-rx'>");
+    svg += String((unsigned long)g_bleRxCnt);
+    svg += F("</tspan></text>");
+  } else if (page == 5) {
+    svg += F("<text x='72' y='118' fill='#888' font-size='9' font-family='system-ui,sans-serif'>WLAN</text>"
+             "<text x='168' y='118' text-anchor='end' fill='#eee' font-size='10' font-family='system-ui,sans-serif'>");
+    svg += g_featureWifi ? F("an") : F("aus");
+    svg += F("</text><text x='72' y='142' fill='#888' font-size='9' font-family='system-ui,sans-serif'>BLE</text>"
+             "<text x='168' y='142' text-anchor='end' fill='#eee' font-size='10' font-family='system-ui,sans-serif'>");
+    svg += g_featureBle ? F("an") : F("aus");
+    svg += F("</text>");
+  } else if (page == 6) {
+    if (g_imuPresent) {
+      char line[24];
+      snprintf(line, sizeof(line), "P %.1f", g_imuPitch);
+      svg += F("<text x='120' y='118' text-anchor='middle' fill='#eee' font-size='11' class='pv-imu-p' font-family='system-ui,sans-serif'>");
+      svg += line;
+      snprintf(line, sizeof(line), "R %.1f", g_imuRoll);
+      svg += F("</text><text x='120' y='142' text-anchor='middle' fill='#eee' font-size='11' class='pv-imu-r' font-family='system-ui,sans-serif'>");
+      svg += line;
+      svg += F("</text>");
+    } else {
+      svg += F("<text x='120' y='132' text-anchor='middle' fill='#c84040' font-size='12' font-family='system-ui,sans-serif'>KEIN IMU</text>");
+    }
+  }
+  svg += F("</svg>");
+}
+
+static String webDisplayPreviewInner(const struct tm* now) {
+  String s;
+  s.reserve(4096);
+  s += F("<div class='preview-content' style='--scale:");
+  s += String(g_dialScalePct);
+  s += F("'>");
+  if (currentPage == 0) webAppendClockSvg(s, now);
+  else webAppendPageMockSvg(s, currentPage);
+  s += F("</div>");
+  return s;
+}
+
+static String webDisplayPreviewShell(const struct tm* now) {
+  String s;
+  s.reserve(4300);
+  s += F("<div class='preview-shell'><div class='preview-bezel'>");
+  s += webDisplayPreviewInner(now);
+  s += F("</div><div class='preview-meta' id='previewMeta'>");
+  s += webPageLabel(currentPage);
+  s += " &middot; ";
+  s += String(g_dialScalePct);
+  s += F("% &middot; ");
+  s += String(g_rotationDeg);
+  s += F("&deg;</div></div>");
+  return s;
+}
+
+static void handleWebPreview() {
+  if (webOtaRejectBusy()) return;
+  struct tm now = {};
+  readClockTime(&now);
+  webServer.send(200, "text/html", webDisplayPreviewShell(&now));
+}
+
 static void handleWebRoot() {
+  if (g_otaBusy) {
+    webServer.send(503, "text/html",
+                    F("<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+                      "<title>OTA</title></head><body><h1>OTA Upload laeuft...</h1><p>Bitte warten.</p></body></html>"));
+    return;
+  }
   struct tm now = {};
   readClockTime(&now);
   char timeStr[16];
   snprintf(timeStr, sizeof(timeStr), "%02d:%02d:%02d", now.tm_hour, now.tm_min, now.tm_sec);
 
   String html;
-  html.reserve(12288);
+  html.reserve(16384);
   html += F("<!DOCTYPE html><html lang='de'><head><meta charset='utf-8'>"
     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
     "<title>VDO Cockpit</title><style>"
@@ -1052,9 +1373,9 @@ static void handleWebRoot() {
     ".metric b{display:block;font-size:1.7rem;color:#fff}.metric span{color:var(--muted);font-size:.9rem}.ok{color:var(--ok)}.warn{color:var(--warn)}"
     "button{background:var(--gold);border:0;border-radius:10px;padding:11px 15px;margin:5px 4px;color:#171200;font-weight:700;cursor:pointer}a{color:#9bd1ff;text-decoration:none}"
     "input[type=range]{width:100%}.row{display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap}.pill{border:1px solid #333;border-radius:999px;padding:6px 10px;color:#ccc}"
-    ".dial{width:min(72vw,310px);aspect-ratio:1;border-radius:50%;margin:12px auto;background:radial-gradient(circle,#29251a 0 8%,#d7d0bd 9% 10%,#111 11% 58%,#2a2a2a 59% 60%,#050505 61%);border:8px solid #2c2c2c;position:relative;box-shadow:inset 0 0 30px #000,0 10px 30px #0007}"
-    ".dial:before{content:'';position:absolute;left:50%;top:16%;width:4px;height:38%;background:#eae6da;transform-origin:50% 100%;transform:translateX(-50%) rotate(28deg);border-radius:4px}.dial:after{content:'';position:absolute;left:50%;top:11%;width:2px;height:43%;background:#df2722;transform-origin:50% 100%;transform:translateX(-50%) rotate(130deg);border-radius:4px}"
-    "table{width:100%;border-collapse:collapse}td,th{padding:9px;border-bottom:1px solid #292929;text-align:left}.file{width:100%;padding:12px;background:#0d0d0d;border:1px solid #333;border-radius:10px;color:#eee}</style></head><body><main>");
+    ".preview-shell{text-align:center;margin:8px auto 16px}.preview-bezel{width:min(78vw,300px);aspect-ratio:1;margin:0 auto;padding:12px;border-radius:50%;background:linear-gradient(145deg,#3a3a3a,#151515);box-shadow:0 16px 36px #0009,inset 0 2px 8px #ffffff14;display:flex;align-items:center;justify-content:center}.preview-content{width:100%;height:100%;transform:scale(calc(var(--scale,100)/100));transform-origin:center}.preview-svg{width:100%;height:auto;display:block;border-radius:50%}.preview-meta{margin-top:10px;color:var(--muted);font-size:.95rem;letter-spacing:.04em}.preview-shell--sm .preview-bezel{width:min(42vw,160px);padding:8px}"
+    "table{width:100%;border-collapse:collapse}td,th{padding:9px;border-bottom:1px solid #292929;text-align:left}.file{width:100%;padding:12px;background:#0d0d0d;border:1px solid #333;border-radius:10px;color:#eee}"
+    ".ota-progress{margin-top:12px}.ota-track{height:10px;background:#222;border-radius:999px;overflow:hidden;border:1px solid #333}.ota-bar{height:100%;width:0;background:linear-gradient(90deg,#b8921f,var(--gold));transition:width .25s}</style></head><body><main>");
   html += F("<h1>VDO Cockpit</h1><div class='sub'>ESP32-S3 WebGUI &middot; IP ");
   html += String(g_ipStr);
   html += F(" &middot; ");
@@ -1062,15 +1383,21 @@ static void handleWebRoot() {
   html += F("</div><input class='tab' id='t0' name='tab' type='radio' checked><input class='tab' id='t1' name='tab' type='radio'><input class='tab' id='t2' name='tab' type='radio'><input class='tab' id='t3' name='tab' type='radio'><input class='tab' id='t4' name='tab' type='radio'>"
             "<nav class='tabs'><label for='t0'>Dashboard</label><label for='t1'>WLAN</label><label for='t2'>Display</label><label for='t3'>Live</label><label for='t4'>Setup</label></nav>");
 
-  html += F("<section class='page' id='p0'><div class='card'><div class='grid'>");
-  html += "<div class='metric'><span>RPM</span><b>" + String((int)g_rpm) + "</b></div>";
-  html += "<div class='metric'><span>ADV</span><b>" + String(g_adv, 1) + "&deg;</b></div>";
-  html += "<div class='metric'><span>Lambda</span><b>" + String(g_lambdaValid ? String(g_lambda, 2) : String("---")) + "</b></div>";
-  html += "<div class='metric'><span>Volt</span><b>" + String(g_battValid ? String(g_battVolt, 1) : String("---")) + "</b></div>";
-  html += F("</div></div><div class='card row'><div><b>BLE Hub</b><br><span class='");
+  html += F("<section class='page' id='p0'><div class='card row'><div><b>Aktive Display-Seite</b><br><span id='dashPageLabel' style='font-size:1.4rem;color:var(--gold)'>");
+  html += webPageLabel(currentPage);
+  html += F("</span></div><div class='pill' id='dashPage'>Seite ");
+  html += String(currentPage);
+  html += F("</div></div><div class='card preview-shell preview-shell--sm' id='dashPreviewHost'><div class='preview-bezel'>");
+  html += webDisplayPreviewInner(&now);
+  html += F("</div></div><div class='card'><div class='grid'>");
+  html += "<div class='metric'><span>RPM</span><b id='dashRpm'>" + String((int)g_rpm) + "</b></div>";
+  html += "<div class='metric'><span>ADV</span><b id='dashAdv'>" + String(g_adv, 1) + "&deg;</b></div>";
+  html += "<div class='metric'><span>Lambda</span><b id='dashLambda'>" + String(g_lambdaValid ? String(g_lambda, 2) : String("---")) + "</b></div>";
+  html += "<div class='metric'><span>Volt</span><b id='dashVolt'>" + String(g_battValid ? String(g_battVolt, 1) : String("---")) + "</b></div>";
+  html += F("</div></div><div class='card row'><div><b>BLE Hub</b><br><span id='dashBle' class='");
   html += g_bleConn ? "ok" : "warn";
   html += "'>" + String(g_featureBle ? (g_bleConn ? "verbunden" : "scan/wartet") : "aus") + "</span></div>";
-  html += "<div class='pill'>Seite " + String(currentPage) + "</div><div class='pill'>RX " + String((unsigned long)g_bleRxCnt) + "</div></div></section>";
+  html += "<div class='pill'>RX <span id='dashRx'>" + String((unsigned long)g_bleRxCnt) + "</span></div></div></section>";
 
   html += F("<section class='page' id='p1'><div class='card'><h2>WLAN</h2><div>Aktiv: <b>");
   html += String(currentWifiSsid());
@@ -1084,7 +1411,9 @@ static void handleWebRoot() {
   }
   html += F("</div><button onclick='scanWifi()'>&#128269; Scan</button><table><thead><tr><th>SSID</th><th>RSSI</th><th>Status</th></tr></thead><tbody id='scanRows'><tr><td colspan='3'>Noch kein Scan</td></tr></tbody></table></div></section>");
 
-  html += F("<section class='page' id='p2'><div class='card'><h2>Display</h2><div class='dial'></div><div class='grid'>"
+  html += F("<section class='page' id='p2'><div class='card'><h2>Display</h2><div id='displayPreviewHost'>");
+  html += webDisplayPreviewShell(&now);
+  html += F("</div><div class='grid'>"
             "<a href='/page?p=0'><button>Uhr</button></a><a href='/page?p=1'><button>Menu</button></a><a href='/page?p=2'><button>Motor</button></a><a href='/page?p=3'><button>Lambda</button></a><a href='/page?p=4'><button>Hub</button></a><a href='/page?p=6'><button>IMU</button></a><a href='/page?p=5'><button>Setup</button></a></div></div>"
             "<div class='card'><h3>Zifferblatt-Groesse</h3><form action='/set' method='get'><div class='row'><b><span id='scaleVal'>");
   html += String(g_dialScalePct);
@@ -1104,17 +1433,64 @@ static void handleWebRoot() {
   html += F("> BLE-Hub Daten aktiv</label></p><p><label><input type='checkbox' name='buzzer' value='1' ");
   html += g_featureBuzzer ? F("checked") : F("");
   html += F("> Buzzer aktiv</label></p><button type='submit'>Speichern</button></form></div>"
-            "<div class='card'><h2>OTA Firmware</h2><form method='POST' action='/update' enctype='multipart/form-data'><input class='file' type='file' name='update' accept='.bin,application/octet-stream'><button type='submit'>Firmware hochladen</button></form></div>"
+            "<div class='card'><h2>OTA Firmware</h2><p class='sub'>Kaputte Updates rollen automatisch zur vorherigen Firmware zurueck. PC-Backup: backups/esp32s3_vdo_backup_2026-06-10.bin (esptool).</p>"
+            "<form id='otaForm' method='POST' action='/update' enctype='multipart/form-data'><input class='file' type='file' name='update' accept='.bin,application/octet-stream' required><button type='submit' id='otaBtn'>Firmware hochladen</button>"
+            "<div class='ota-progress' id='otaProgress' hidden><div class='ota-track'><div class='ota-bar' id='otaBar'></div></div><p id='otaStatus' class='sub'>Upload laeuft...</p></div></form></div>"
             "<div class='card'><h2>Restart</h2><a href='/restart'><button>ESP32 neu starten</button></a></div></section>");
 
   html += F("<script>"
+            "const pageNames=['UHR','MENU','MOTOR','LAMBDA','HUB','SETUP','IMU'];"
+            "let lastPreviewPage=-2,espH=0,espM=0,espS=0,espSync=0,liveTimer=null,handTimer=null;"
+            "function pvSet(sel,v){document.querySelectorAll(sel).forEach(e=>e.textContent=v);}"
+            "function setHand(sel,deg){document.querySelectorAll(sel).forEach(g=>g.setAttribute('transform','rotate('+deg.toFixed(2)+')'));}"
+            "function updateHands(){if(lastPreviewPage!==0)return;const t=Math.floor((Date.now()-espSync)/1000);"
+            "const totalSec=espS+t,sec=totalSec%60,totalMin=espM+Math.floor(totalSec/60),min=totalMin%60,h=(espH+Math.floor(totalMin/60))%12;"
+            "setHand('.hand-s',sec*6);setHand('.hand-m',min*6+sec*0.1);setHand('.hand-h',h*30+min*0.5);}"
+            "function applyPreviewMeta(d){const meta=document.getElementById('previewMeta');"
+            "if(meta)meta.textContent=(pageNames[d.page]||'?')+' · '+(d.scale||100)+'% · '+(d.rotation||0)+'°';"
+            "const sv=document.getElementById('scaleVal');if(sv)sv.textContent=String(d.scale||100);"
+            "document.querySelectorAll('.preview-content').forEach(el=>{el.style.setProperty('--scale',d.scale||100);});}"
+            "function syncPreviewValues(d){applyPreviewMeta(d);espH=d.hour||0;espM=d.min||0;espS=d.sec||0;espSync=Date.now();"
+            "if(d.page===0){updateHands();return;}if(d.page===2){const ok=d.ble_connected&&d.ble_enabled;"
+            "pvSet('.pv-rpm',ok?String(Math.round(d.rpm||0)):'0');pvSet('.pv-adv',ok?String(Math.round(d.adv||0)):'0');"
+            "pvSet('.pv-map',ok?String(Math.round(d.map||0)):'0');pvSet('.pv-batt',d.volt_valid?(d.volt||0).toFixed(1)+'V':'---');"
+            "pvSet('.pv-motor-st',ok?(d.ble_connected?'LIVE':'WARTE'):'---');}"
+            "if(d.page===3)pvSet('.pv-lambda',d.lambda_valid?(d.lambda||0).toFixed(2):'----');"
+            "if(d.page===4){pvSet('.pv-hub-st',d.ble_connected?'HUB OK':'KEIN HUB');pvSet('.pv-rx',String(d.ble_rx||0));}"
+            "if(d.page===6&&d.imu_present){pvSet('.pv-imu-p','P '+(d.imu_pitch||0).toFixed(1));pvSet('.pv-imu-r','R '+(d.imu_roll||0).toFixed(1));}}"
+            "function syncPreviewContent(html){const m=html.match(/<div class='preview-content'[\\s\\S]*?<\\/div>/);if(!m)return;"
+            "const inner=m[0].replace(/--rot:[^;'\"]+;?/g,'');"
+            "const dash=document.getElementById('dashPreviewHost');if(dash){const b=dash.querySelector('.preview-bezel');if(b)b.innerHTML=inner;}}"
+            "async function refreshPreview(){try{const r=await fetch('/api/preview');let html=await r.text();html=html.replace(/--rot:[^;'\"]+;?/g,'');"
+            "const host=document.getElementById('displayPreviewHost');if(host)host.innerHTML=html;syncPreviewContent(html);}catch(e){}}"
+            "function syncDashboard(d){if(!d)return;const set=(id,v)=>{const e=document.getElementById(id);if(e)e.textContent=v;};"
+            "set('dashRpm',Math.round(d.rpm||0));set('dashAdv',(d.adv||0).toFixed(1)+'°');"
+            "set('dashLambda',d.lambda_valid?(d.lambda||0).toFixed(2):'---');set('dashVolt',d.volt_valid?(d.volt||0).toFixed(1):'---');"
+            "set('dashPage',String(d.page));set('dashPageLabel',pageNames[d.page]||'?');set('dashRx',String(d.ble_rx||0));"
+            "const ble=document.getElementById('dashBle');if(ble){ble.textContent=d.ble_enabled?(d.ble_connected?'verbunden':'scan/wartet'):'aus';"
+            "ble.className=d.ble_enabled&&d.ble_connected?'ok':'warn';}"
+            "if(d.page!==lastPreviewPage){lastPreviewPage=d.page;refreshPreview().then(()=>syncPreviewValues(d));}"
+            "else syncPreviewValues(d);}"
             "async function scanWifi(){const rows=document.getElementById('scanRows');rows.innerHTML='<tr><td colspan=3>Scan laeuft...</td></tr>';try{const r=await fetch('/scan');const d=await r.json();rows.innerHTML=d.networks.map(n=>`<tr><td>${n.ssid}</td><td>${n.rssi}</td><td>${n.connected?'verbunden':''}</td></tr>`).join('')||'<tr><td colspan=3>Keine Netze</td></tr>';}catch(e){rows.innerHTML='<tr><td colspan=3>Scan fehlgeschlagen</td></tr>';}}"
-            "async function live(){try{const r=await fetch('/api/status');const d=await r.json();document.getElementById('liveBox').textContent=JSON.stringify(d,null,2);}catch(e){document.getElementById('liveBox').textContent='Live-Status nicht erreichbar';}}"
-            "live();setInterval(live,2000);</script><p class='sub'>VW T2b Cockpit &middot; ESP32-S3 2.8C</p></main></body></html>");
+            "async function live(){try{const r=await fetch('/api/status');const d=await r.json();document.getElementById('liveBox').textContent=JSON.stringify(d,null,2);syncDashboard(d);}catch(e){document.getElementById('liveBox').textContent='Live-Status nicht erreichbar';}}"
+            "const otaForm=document.getElementById('otaForm');"
+            "function otaShow(pct,msg){const bar=document.getElementById('otaBar');const st=document.getElementById('otaStatus');const box=document.getElementById('otaProgress');if(box)box.hidden=false;if(bar)bar.style.width=Math.max(0,Math.min(100,pct))+'%';if(st)st.textContent=msg||'Upload laeuft...';}"
+            "if(otaForm){otaForm.addEventListener('submit',ev=>{ev.preventDefault();const fd=new FormData(otaForm);const file=fd.get('update');if(!file||!file.size)return;"
+            "if(liveTimer)clearInterval(liveTimer);if(handTimer)clearInterval(handTimer);"
+            "const btn=document.getElementById('otaBtn');if(btn)btn.disabled=true;otaShow(0,'Upload laeuft...');"
+            "let poll=setInterval(async()=>{try{const r=await fetch('/api/ota/progress');const d=await r.json();"
+            "if(d.active&&d.total>0){const n=Math.min(99,Math.round(100*(d.written||d.rx)/d.total));otaShow(n,'Flash '+n+'%');}}catch(e){}},500);"
+            "const xhr=new XMLHttpRequest();xhr.open('POST','/update');"
+            "xhr.upload.onprogress=e=>{if(e.lengthComputable){const n=Math.round(100*e.loaded/e.total);otaShow(Math.min(92,n),'Upload laeuft... '+n+'%');}else otaShow(0,'Upload laeuft...');};"
+            "xhr.onload=()=>{clearInterval(poll);if(xhr.status===200&&xhr.responseText.trim()==='OK')otaShow(100,'Erfolg, Neustart...');"
+            "else{otaShow(0,'Fehler ('+xhr.status+'): '+(xhr.responseText||'FAIL'));if(btn)btn.disabled=false;}};"
+            "xhr.onerror=()=>{clearInterval(poll);otaShow(0,'Netzwerkfehler');if(btn)btn.disabled=false;};xhr.send(fd);});}"
+            "live();liveTimer=setInterval(live,1000);handTimer=setInterval(updateHands,250);</script><p class='sub'>VW T2b Cockpit &middot; ESP32-S3 2.8C</p></main></body></html>");
   webServer.send(200, "text/html", html);
 }
 
 static void handleWebScan() {
+  if (webOtaRejectBusy()) return;
   int count = WiFi.scanNetworks();
   String json = F("{\"networks\":[");
   const String connectedSsid = WiFi.SSID();
@@ -1135,16 +1511,27 @@ static void handleWebScan() {
 }
 
 static void handleWebStatus() {
+  if (webOtaRejectBusy()) return;
+  struct tm now = {};
+  readClockTime(&now);
   String json;
-  json.reserve(512);
+  json.reserve(640);
   json += F("{\"time\":");
   json += String((unsigned long)time(nullptr));
+  json += F(",\"hour\":");
+  json += String(now.tm_hour);
+  json += F(",\"min\":");
+  json += String(now.tm_min);
+  json += F(",\"sec\":");
+  json += String(now.tm_sec);
   json += F(",\"ip\":\"");
   json += jsonEscape(String(g_ipStr));
   json += F("\",\"rpm\":");
   json += String(g_rpm, 0);
   json += F(",\"adv\":");
   json += String(g_adv, 1);
+  json += F(",\"map\":");
+  json += String(g_map, 0);
   json += F(",\"lambda\":");
   json += String(g_lambda, 3);
   json += F(",\"lambda_valid\":");
@@ -1161,11 +1548,38 @@ static void handleWebStatus() {
   json += String((unsigned long)g_bleRxCnt);
   json += F(",\"page\":");
   json += String(currentPage);
-  json += F(",\"scale\":");
+  json += F(",\"page_label\":\"");
+  json += webPageLabel(currentPage);
+  json += F("\",\"scale\":");
   json += String(g_dialScalePct);
   json += F(",\"rotation\":");
   json += String(g_rotationDeg);
-  json += '}';
+  json += F(",\"imu_present\":");
+  json += g_imuPresent ? F("true") : F("false");
+  json += F(",\"imu_pitch\":");
+  json += String(g_imuPitch, 1);
+  json += F(",\"imu_roll\":");
+  json += String(g_imuRoll, 1);
+  json += F(",\"ota_boot\":\"");
+  json += g_otaBootLabel;
+  json += F("\"}");
+  webServer.send(200, "application/json", json);
+}
+
+static void handleWebOtaProgress() {
+  String json;
+  json.reserve(96);
+  json += F("{\"active\":");
+  json += g_otaBusy ? F("true") : F("false");
+  json += F(",\"rx\":");
+  json += String((unsigned long)g_otaRxBytes);
+  json += F(",\"written\":");
+  json += String((unsigned)Update.progress());
+  json += F(",\"total\":");
+  json += String((unsigned)Update.size());
+  json += F(",\"boot\":\"");
+  json += g_otaBootLabel;
+  json += F("\"}");
   webServer.send(200, "application/json", json);
 }
 
@@ -1244,35 +1658,30 @@ static void startWebServer() {
   webServer.on("/wifi",    handleWebWifi);
   webServer.on("/scan",    HTTP_GET, handleWebScan);
   webServer.on("/api/status", HTTP_GET, handleWebStatus);
+  webServer.on("/api/ota/progress", HTTP_GET, handleWebOtaProgress);
+  webServer.on("/api/preview", HTTP_GET, handleWebPreview);
   webServer.on("/restart", HTTP_GET, handleWebRestart);
   webServer.on("/update", HTTP_POST, []() {
-    const bool ok = !Update.hasError();
+    const bool ok = !Update.hasError() && Update.remaining() == 0;
     webServer.sendHeader("Connection", "close");
     webServer.send(ok ? 200 : 500, "text/plain", ok ? "OK" : "FAIL");
     if (ok) {
       delay(500);
       ESP.restart();
+    } else {
+      g_otaBusy = false;
+      hal_pause_for_ota(false);
     }
   }, []() {
     HTTPUpload& upload = webServer.upload();
     if (upload.status == UPLOAD_FILE_START) {
-      Serial.printf("OTA: Start %s\n", upload.filename.c_str());
-      if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
-        Update.printError(Serial);
-      }
+      webOtaBeginUpload(upload.filename.c_str());
     } else if (upload.status == UPLOAD_FILE_WRITE) {
-      if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
-        Update.printError(Serial);
-      }
+      webOtaWriteChunk(upload.buf, upload.currentSize);
     } else if (upload.status == UPLOAD_FILE_END) {
-      if (Update.end(true)) {
-        Serial.printf("OTA: Erfolg, %u Bytes\n", upload.totalSize);
-      } else {
-        Update.printError(Serial);
-      }
+      webOtaFinishUpload(upload.totalSize);
     } else if (upload.status == UPLOAD_FILE_ABORTED) {
-      Update.end();
-      Serial.println("OTA: abgebrochen");
+      webOtaAbortUpload();
     }
   });
   webServer.begin();
@@ -1382,6 +1791,7 @@ void setup() {
   uint32_t serialWait = millis();
   while (!Serial && millis() - serialWait < 2000) delay(10);
   Serial.println("\n=== Waveshare 2.8C VDO Clock ===");
+  otaNoteBootState();
   Serial.printf("PSRAM found: %s, size: %u bytes\n", psramFound() ? "yes" : "no", ESP.getPsramSize());
 
   // Backlight diagnostic blink (2x 50ms) before panel init.
@@ -1412,6 +1822,7 @@ void setup() {
 
   Serial.println("Display: HAL init...");
   hal_init();
+  otaValidatePendingBoot();
   gt911Init();
 
   // QMI8658 IMU erkennen + initialisieren (I2C laeuft via hal_init/Wire)
@@ -1426,6 +1837,7 @@ void setup() {
   initTimeSource();
   hal_backlight(true);
   drawVdoClock();
+  otaConfirmBootIfPending();
   Serial.println("VDO clock drawn.");
 }
 
@@ -1440,6 +1852,15 @@ void loop() {
   static uint16_t touchStartX = 0, touchStartY = 0;
   static uint16_t touchLastX = 0, touchLastY = 0;
   uint16_t x = 0, y = 0;
+
+  if (g_otaBusy) {
+    if (g_webStarted) {
+      for (uint8_t n = 0; n < 32; n++) webServer.handleClient();
+    }
+    yield();
+    delay(2);
+    return;
+  }
 
 #if FEATURE_TOUCH
   const uint32_t nowMs = millis();
@@ -1537,14 +1958,14 @@ void loop() {
   // Fallback-Setup-AP verwalten (nur AN wenn keine STA-Verbindung)
   manageWifiAp();
 
+  // Web server
+  if (g_webStarted) webServer.handleClient();
+
   // WiFi/NTP background tick; redraw clock on fresh sync
   if (wifiNtpTick() && currentPage == 0) drawVdoClock();
 
   // BLE client tick
   if (g_featureBle) bleTick();
-
-  // Web server
-  if (g_webStarted) webServer.handleClient();
 
   // Redraw after web/serial change
   if (g_redrawPage) {

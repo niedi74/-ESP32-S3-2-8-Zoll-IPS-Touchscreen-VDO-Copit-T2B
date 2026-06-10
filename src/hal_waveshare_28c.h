@@ -289,6 +289,30 @@ void hal_restart() {
   if (hal_panel) esp_lcd_rgb_panel_restart(hal_panel);
 }
 
+// RGB VSYNC ISR laeuft aus Flash. OTA (Update.write) deaktiviert den Flash-Cache
+// periodisch -> ohne Pause kann die TCP-Verbindung bei ~128 KB abbrechen.
+static bool hal_otaPaused = false;
+
+void hal_pause_for_ota(bool pause) {
+  if (pause) {
+    if (!hal_panel || hal_otaPaused) return;
+    esp_lcd_panel_del(hal_panel);
+    hal_panel = nullptr;
+    hal_ready = false;
+    hal_backlight(false);
+    hal_otaPaused = true;
+    Serial.println("HAL: RGB pausiert fuer OTA");
+  } else if (hal_otaPaused) {
+    hal_otaPaused = false;
+    if (hal_panel_init()) {
+      hal_backlight(true);
+      Serial.println("HAL: RGB nach OTA wieder aktiv");
+    } else {
+      Serial.println("HAL: RGB resume FAIL");
+    }
+  }
+}
+
 void hal_fill(uint16_t color) {
   uint16_t *fb = hal_fb();
   if (!fb) return;
