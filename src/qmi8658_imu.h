@@ -25,8 +25,13 @@ extern float g_imuPitch;
 extern float g_imuRoll;
 extern float g_imuGForce;
 extern bool g_imuPresent;
+extern float g_imuOffPitch;
+extern float g_imuOffRoll;
+extern bool g_imuTrimmed;
 
 bool qmi8658Detect(void);
 void qmi8658Init(void);
 void qmi8658Read(void);
 bool qmi8658ShakeDetected(float threshold);
+void qmi8658SetTrim(float pitchOff, float rollOff, bool active);
+bool qmi8658Zero(void);

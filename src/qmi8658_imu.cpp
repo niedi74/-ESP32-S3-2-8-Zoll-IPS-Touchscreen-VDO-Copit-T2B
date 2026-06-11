@@ -6,6 +6,9 @@ float g_imuPitch = 0;
 float g_imuRoll = 0;
 float g_imuGForce = 0;
 bool g_imuPresent = false;
+float g_imuOffPitch = 0;
+float g_imuOffRoll = 0;
+bool g_imuTrimmed = false;
 
 static float accelScale = 4.0f / 32768.0f;   // 4G range
 static float gyroScale = 512.0f / 32768.0f; // 512 DPS range
@@ -48,9 +51,9 @@ void qmi8658Init(void) {
     delay(10);
 }
 
-void qmi8658Read(void) {
+static bool qmi8658ReadSample(float* pitch, float* roll) {
     uint8_t buf[12];
-    if (!qmiReadRegs(QMI8658_AX_L, buf, 12)) return;
+    if (!qmiReadRegs(QMI8658_AX_L, buf, 12)) return false;
 
     int16_t ax = (buf[1] << 8) | buf[0];
     int16_t ay = (buf[3] << 8) | buf[2];
@@ -66,9 +69,38 @@ void qmi8658Read(void) {
     g_imuGyro.y = gy * gyroScale;
     g_imuGyro.z = gz * gyroScale;
 
-    g_imuPitch = atan2(g_imuAccel.y, sqrt(g_imuAccel.x*g_imuAccel.x + g_imuAccel.z*g_imuAccel.z)) * 180.0 / PI;
-    g_imuRoll  = atan2(-g_imuAccel.x, g_imuAccel.z) * 180.0 / PI;
+    const float rawPitch = atan2(g_imuAccel.y, sqrt(g_imuAccel.x*g_imuAccel.x + g_imuAccel.z*g_imuAccel.z)) * 180.0 / PI;
+    const float rawRoll  = atan2(-g_imuAccel.x, g_imuAccel.z) * 180.0 / PI;
+    if (pitch) *pitch = rawPitch;
+    if (roll)  *roll  = rawRoll;
     g_imuGForce = sqrt(g_imuAccel.x*g_imuAccel.x + g_imuAccel.y*g_imuAccel.y + g_imuAccel.z*g_imuAccel.z);
+    return true;
+}
+
+void qmi8658SetTrim(float pitchOff, float rollOff, bool active) {
+    g_imuOffPitch = pitchOff;
+    g_imuOffRoll  = rollOff;
+    g_imuTrimmed  = active;
+}
+
+void qmi8658Read(void) {
+    float rawPitch = 0;
+    float rawRoll = 0;
+    if (!qmi8658ReadSample(&rawPitch, &rawRoll)) return;
+    g_imuPitch = rawPitch - g_imuOffPitch;
+    g_imuRoll  = rawRoll  - g_imuOffRoll;
+}
+
+bool qmi8658Zero(void) {
+    float rawPitch = 0;
+    float rawRoll = 0;
+    if (!qmi8658ReadSample(&rawPitch, &rawRoll)) return false;
+    g_imuOffPitch = rawPitch;
+    g_imuOffRoll  = rawRoll;
+    g_imuTrimmed  = true;
+    g_imuPitch = 0;
+    g_imuRoll  = 0;
+    return true;
 }
 
 bool qmi8658ShakeDetected(float threshold) {

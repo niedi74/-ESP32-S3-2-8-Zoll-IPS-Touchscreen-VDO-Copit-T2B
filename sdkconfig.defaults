@@ -1,0 +1,2 @@
+# OTA: neue Firmware startet als PENDING_VERIFY; ohne Bestaetigung Rollback zur vorherigen App.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
