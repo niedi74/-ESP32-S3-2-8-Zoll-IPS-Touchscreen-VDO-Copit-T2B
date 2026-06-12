@@ -28,9 +28,19 @@ runden Touch-Display im Cockpit. Holt optional Live-Daten vom **Spartan3-Hub**
 
 ## Funktion
 
-1. **Uhr-Modus** (Default): analoge VDO-Uhr, NTP-synchronisiert (WiFi) oder RTC
+1. **Uhr-Modus** (Default): analoge VDO-Uhr, Hub-NTP / lokales NTP (WiFi) oder RTC
 2. **Gateway-Modus** (optional): verbindet zu `Spartan3-Hub`, zeigt Live-Daten
    (Lambda, RPM, Speed, Batterie) — gleiches BLE-Payload wie der M5 Dial
+
+## Zeit-Synchronisation
+
+Priorität (bis RTC-Batterien auf Hub und Display):
+
+1. **Hub** — wenn `hub_wifi_ok` und Hub `/api/status` liefert `ntp_synced:true` + `time_epoch` (Poll alle 300 ms, Uhr-Resync alle 60 s)
+2. **Lokales NTP** — Home-WLAN mit Internet
+3. **RTC / Build-Zeit** — PCF85063 oder Flash-Build-Zeit
+
+Der Hub ist Time-Master: Phone-Hotspot → Hub-NTP → Waveshare übernimmt Hub-Zeit.
 
 ## BLE Gateway Payload (vom Spartan-Hub)
 

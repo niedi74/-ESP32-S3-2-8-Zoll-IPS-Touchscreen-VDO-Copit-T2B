@@ -191,9 +191,6 @@ enum DataPath : uint8_t { DATA_PATH_WIFI_HUB = 0, DATA_PATH_BLE = 1 };
 #define HUB_WIFI_POLL_MS      300
 #define HUB_WIFI_TIMEOUT_MS   1200
 #define DATA_FRESH_MS         3000
-#define WIFI_BUS_FAILOVER_MS  45000
-#define HUB_BUS_FAILOVER_MS   20000
-
 static DataPath  g_dataPath       = DATA_PATH_WIFI_HUB;
 static char      g_hubHost[48]    = HUB_WIFI_DEFAULT_HOST;
 static bool      g_hubWifiOk      = false;
@@ -481,10 +478,24 @@ static bool isOnBusWifi() {
 
 static void syncHubHostForWifi() {
   if (WiFi.status() != WL_CONNECTED) return;
-  if (WiFi.SSID() != HUB_SETUP_WIFI_SSID) return;
-  if (strcmp(g_hubHost, HUB_BUS_HOST) != 0) saveHubHost(HUB_BUS_HOST);
+  if (WiFi.SSID() == HUB_SETUP_WIFI_SSID) {
+    if (strcmp(g_hubHost, HUB_BUS_HOST) != 0) saveHubHost(HUB_BUS_HOST);
+  } else if (strcmp(WiFi.SSID().c_str(), WIFI_SSID) == 0
+#ifdef WIFI_SSID_2
+             || strcmp(WiFi.SSID().c_str(), WIFI_SSID_2) == 0
+#endif
+            ) {
+    if (strcmp(g_hubHost, HUB_WIFI_DEFAULT_HOST) != 0) saveHubHost(HUB_WIFI_DEFAULT_HOST);
+  } else {
+    IPAddress gw = WiFi.gatewayIP();
+    if (gw[0] != 0) {
+      char buf[20];
+      snprintf(buf, sizeof(buf), "%s", gw.toString().c_str());
+      if (strcmp(g_hubHost, buf) != 0) saveHubHost(buf);
+    }
+  }
   if (g_dataPath != DATA_PATH_WIFI_HUB) saveDataPath(DATA_PATH_WIFI_HUB);
-  if (g_featureBle) saveFeatures(g_featureWifi, false, g_featureBuzzer);
+  if (isOnBusWifi() && g_featureBle) saveFeatures(g_featureWifi, false, g_featureBuzzer);
 }
 
 static void applyBusProfile(bool reconnect) {
@@ -540,7 +551,6 @@ static bool     g_ntpSynced        = false;
 static bool     g_ntpResyncRequested = false;
 static uint32_t g_lastRtcSyncMs    = 0;
 static constexpr uint32_t NTP_RESYNC_INTERVAL_MS = 15UL * 60UL * 1000UL;  // 15 min (ESP default: 1 h)
-
 static uint8_t timezoneCount() { return TIMEZONE_COUNT; }
 
 static const char* timezoneLabel(uint8_t idx) {
@@ -624,14 +634,15 @@ static void rtcWrite(const struct tm *t) {
   Wire.endTransmission();
 }
 
+static const char* clockSourceLabel();
+
 static bool readClockTime(struct tm *now) {
-  // Single time source for WebGUI and drawVdoClock: SNTP (TZ via configTzTime) first.
-  // PCF85063 is fallback only before NTP; never prefer stale RTC when SNTP is valid.
+  // Priority: Hub NTP (via /api/status) > local SNTP > PCF85063 RTC.
   const char *src = "none";
   time_t t = time(nullptr);
   if (t > 1700000000) {
     localtime_r(&t, now);
-    src = "SNTP";
+    src = clockSourceLabel();
   } else if (rtcRead(now)) {
     src = "RTC";
   } else {
@@ -669,6 +680,13 @@ static bool syncRtcFromNtp(const struct tm *ntpLocal, bool force) {
                 ntpLocal->tm_year + 1900, ntpLocal->tm_mon + 1, ntpLocal->tm_mday,
                 ntpLocal->tm_hour, ntpLocal->tm_min, ntpLocal->tm_sec);
   return true;
+}
+
+static const char* clockSourceLabel() {
+  if (g_ntpSynced) return "SNTP";
+  time_t t = time(nullptr);
+  if (t > 1700000000) return "SYS";
+  return "RTC";
 }
 
 static void initTimeSource() {
@@ -714,12 +732,6 @@ static bool wifiNtpTick() {
 
   if (WiFi.status() != WL_CONNECTED) {
     if (failSince == 0) failSince = millis();
-    else if (!g_wifiApOnly && !isOnBusWifi() && hubWifiProfileIndex() != 0xFF &&
-             millis() - failSince >= WIFI_BUS_FAILOVER_MS) {
-      Serial.println("WiFi: Home timeout -> BUS failover");
-      applyBusProfile(true);
-      failSince = 0;
-    }
     if (millis() - lastTry > 30000) {
       lastTry = millis();
       WiFi.begin(currentWifiSsid(), currentWifiPassword());  // kein disconnect() davor
@@ -829,6 +841,18 @@ static bool jsonExtractBool(const String& json, const char* key, bool* out) {
   return false;
 }
 
+static bool jsonExtractULong(const String& json, const char* key, unsigned long* out) {
+  const int i = jsonKeyPos(json, key);
+  if (i < 0) return false;
+  int p = i + (int)strlen(key) + 3;
+  while (p < (int)json.length() && (json[p] == ' ' || json[p] == '\t')) p++;
+  char* end = nullptr;
+  const unsigned long v = strtoul(json.substring(p).c_str(), &end, 10);
+  if (end == nullptr || v == 0) return false;
+  *out = v;
+  return true;
+}
+
 static bool jsonExtractString(const String& json, const char* key, char* out, size_t outLen) {
   const int i = jsonKeyPos(json, key);
   if (i < 0) return false;
@@ -911,7 +935,6 @@ static bool pollHubAtHost(const char* host, uint32_t now, bool persistHost) {
 static void hubWifiPollTick() {
   if (g_dataPath != DATA_PATH_WIFI_HUB || !g_featureWifi) return;
   static uint32_t nextPollMs = 0;
-  static uint32_t hubFailSince = 0;
   const uint32_t now = millis();
   if (now < nextPollMs) return;
   nextPollMs = now + HUB_WIFI_POLL_MS;
@@ -922,6 +945,7 @@ static void hubWifiPollTick() {
     g_hubState[sizeof(g_hubState) - 1] = 0;
     return;
   }
+  syncHubHostForWifi();
   if (g_hubHost[0] == '\0') {
     g_hubWifiOk = false;
     strncpy(g_hubState, "no_host", sizeof(g_hubState));
@@ -930,31 +954,12 @@ static void hubWifiPollTick() {
   }
 
   g_hubPollCnt++;
-  if (pollHubAtHost(g_hubHost, now, false)) {
-    hubFailSince = 0;
-    return;
-  }
+  if (pollHubAtHost(g_hubHost, now, false)) return;
 
   g_hubWifiOk = false;
   g_hubErrCnt++;
   strncpy(g_hubState, "poll_fail", sizeof(g_hubState));
   g_hubState[sizeof(g_hubState) - 1] = 0;
-
-  if (strcmp(g_hubHost, HUB_BUS_HOST) != 0 && pollHubAtHost(HUB_BUS_HOST, now, true)) {
-    hubFailSince = 0;
-    return;
-  }
-
-  if (!isOnBusWifi() && hubWifiProfileIndex() != 0xFF) {
-    if (hubFailSince == 0) hubFailSince = now;
-    else if (now - hubFailSince >= HUB_BUS_FAILOVER_MS) {
-      Serial.println("Hub: poll timeout -> BUS failover");
-      applyBusProfile(true);
-      hubFailSince = 0;
-    }
-  } else {
-    hubFailSince = 0;
-  }
 }
 
 // -------- BLE Spartan3-Hub / 123TUNE+ client --------
@@ -2662,7 +2667,10 @@ static bool bleFresh() { return dataFresh(); }
 static const char* liveStatusText() {
   if (dataFresh()) return "LIVE";
   if (hubLinkOk()) return "WARTE";
-  if (g_dataPath == DATA_PATH_WIFI_HUB) return "KEIN HUB";
+  if (g_dataPath == DATA_PATH_WIFI_HUB) {
+    if (!g_featureWifi || WiFi.status() != WL_CONNECTED) return "WiFi...";
+    return "Hub...";
+  }
   return g_bleConnMode == BLE_MODE_SPARTAN_HUB ? "KEIN HUB" : "KEIN 123";
 }
 
@@ -3871,7 +3879,9 @@ static void handleWebStatus() {
   json += String(now.tm_min);
   json += F(",\"sec\":");
   json += String(now.tm_sec);
-  json += F(",\"tz_idx\":");
+  json += F(",\"time_source\":\"");
+  json += clockSourceLabel();
+  json += F("\",\"tz_idx\":");
   json += String(g_timezoneIdx);
   json += F(",\"tz_label\":\"");
   json += jsonEscape(String(timezoneLabel(g_timezoneIdx)));
